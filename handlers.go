@@ -928,7 +928,16 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, pr
 		// inserted would silently resurrect it — the victim stays evicted while
 		// the attacker keeps rotating. The predecessor row disappearing is that
 		// signal: undo our own insert by revoking the family we issued into.
-		if _, still, err := p.store.GetRefreshToken(ctx, prev.hash); err != nil || !still {
+		_, still, err := p.store.GetRefreshToken(ctx, prev.hash)
+		if err != nil {
+			// A transient read error is not proof of revocation. The
+			// predecessor is already consumed either way, so nothing usable is
+			// left behind by failing closed here WITHOUT revoking the family —
+			// revoking on a DB blip would log the legitimate client out.
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not verify token rotation")
+			return
+		}
+		if !still {
 			_ = p.store.RevokeRefreshTokenFamily(ctx, familyID)
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant",
 				"refresh token was already used; the whole token family has been revoked, sign in again")

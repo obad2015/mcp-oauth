@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -79,6 +80,7 @@ type storeVerifier struct {
 
 	canaryClientID    string
 	canaryRefreshHash string
+	canaryAtomicHash  string
 }
 
 func (v *storeVerifier) failf(format string, args ...any) {
@@ -335,6 +337,26 @@ func (v *storeVerifier) checkRefreshToken() {
 			"path here mints a token row that was never issued")
 	}
 
+	// The canary is right now in exactly the state PurgeExpired must retain: its
+	// own ExpiresAt has passed but its FamilyExpiresAt has not — the state a
+	// consumed row spends most of its life in. A purge written
+	// `WHERE expires_at < $1` (dropping `AND family_expires_at < $1`) deletes
+	// the reuse-detection ledger the moment the token's own TTL lapses, so a
+	// token stolen earlier and replayed later comes back as a plain
+	// invalid_grant instead of revoking the thief's family.
+	if err := v.p.store.PurgeExpired(v.ctx, v.now); err != nil {
+		v.failf("PurgeExpired failed: %v", err)
+		return
+	}
+	if _, still, err := v.p.store.GetRefreshToken(v.ctx, hash); err != nil || !still {
+		v.failf("PurgeExpired deleted a refresh token whose own ExpiresAt has passed but " +
+			"whose FamilyExpiresAt has not: it must delete a row only when BOTH have passed. " +
+			"The DELETE is missing its `AND family_expires_at < $1` condition — without it, a " +
+			"token stolen earlier and replayed after its own expiry is a plain invalid_grant " +
+			"with no family revocation, instead of the reuse signal it must be")
+		return
+	}
+
 	// First consume: the row must come back UNconsumed and must survive. Note
 	// the canary's own ExpiresAt has passed: an expired CONSUMED row is the
 	// reuse-detection ledger, so ConsumeRefreshToken must still return it.
@@ -424,6 +446,86 @@ func (v *storeVerifier) checkRefreshToken() {
 		v.failf("RevokeRefreshTokenFamily left a token of the revoked family alive: " +
 			"reuse detection would revoke a family that keeps working")
 	}
+
+	v.checkRefreshTokenAtomicity()
+}
+
+// atomicityConcurrency is how many goroutines race ConsumeRefreshToken for the
+// same hash. Every check above is single-threaded, so a Store implemented as
+// SELECT-then-UPDATE (no `FOR UPDATE`, or a read/modify/save ORM call) passes
+// all of them: under concurrency, every caller reads ConsumedAt as zero before
+// any of them writes, so all N return ok=true with a zero ConsumedAt. The
+// Provider treats each as a legitimate first rotation, so one stolen token
+// forks into N independently usable successor chains and reuse detection can
+// never fire again — there is no longer a single canonical "next" token whose
+// replay would be caught.
+const atomicityConcurrency = 8
+
+func (v *storeVerifier) checkRefreshTokenAtomicity() {
+	hash := v.canary("atomic")
+	v.canaryAtomicHash = hash
+	familyID := "mcpoauth-verify-atomic-family-" + v.canary("atomic-family")[:16]
+	want := RefreshToken{
+		TokenHash:       hash,
+		ClientID:        v.canaryClientID,
+		UserID:          v.userID,
+		FamilyID:        familyID,
+		FamilyCreatedAt: v.now.Add(-time.Hour),
+		FamilyExpiresAt: v.now.Add(time.Hour),
+		ExpiresAt:       v.now.Add(time.Hour),
+		CreatedAt:       v.now,
+	}
+	if err := v.p.store.SaveRefreshToken(v.ctx, want); err != nil {
+		v.failf("SaveRefreshToken (atomicity canary) failed: %v", err)
+		return
+	}
+
+	type result struct {
+		rt  RefreshToken
+		ok  bool
+		err error
+	}
+	results := make([]result, atomicityConcurrency)
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-ready
+			rt, ok, err := v.p.store.ConsumeRefreshToken(v.ctx, hash, v.now)
+			results[i] = result{rt, ok, err}
+		}(i)
+	}
+	close(ready)
+	wg.Wait()
+
+	zeroCount := 0
+	for i, r := range results {
+		if r.err != nil {
+			v.failf("ConsumeRefreshToken (concurrent call %d of %d) failed: %v",
+				i+1, atomicityConcurrency, r.err)
+			return
+		}
+		if !r.ok {
+			v.failf("ConsumeRefreshToken (concurrent call %d of %d) returned ok=false for a "+
+				"token that was saved moments earlier", i+1, atomicityConcurrency)
+			return
+		}
+		if r.rt.ConsumedAt.IsZero() {
+			zeroCount++
+		}
+	}
+	if zeroCount != 1 {
+		v.failf("ConsumeRefreshToken is not atomic: of %d concurrent calls for the SAME "+
+			"refresh token, %d observed a zero ConsumedAt (want exactly 1). A "+
+			"SELECT-then-UPDATE (or a read/modify/save ORM call) lets every concurrent caller "+
+			"read the row before any of them writes, so a single stolen token forks into %d "+
+			"independently usable rotation chains and reuse detection can never fire again. Use "+
+			"the documented CTE idiom: `SELECT ... FOR UPDATE` inside the same statement as the "+
+			"`consumed_at IS NULL`-guarded UPDATE",
+			atomicityConcurrency, zeroCount, atomicityConcurrency)
+	}
 }
 
 // withinTolerance reports whether got is close enough to want to be the same
@@ -449,9 +551,13 @@ func (v *storeVerifier) cleanup() {
 	}
 	// A compliant Store already dropped the refresh canary in
 	// RevokeRefreshTokenFamily; one that did not gets it purged here instead of
-	// leaving it behind forever.
-	if v.canaryRefreshHash != "" {
-		if rt, ok, err := v.p.store.GetRefreshToken(v.ctx, v.canaryRefreshHash); err == nil && ok {
+	// leaving it behind forever. The atomicity canary (checkRefreshTokenAtomicity)
+	// is never revoked at all, so it always needs this sweep.
+	for _, hash := range []string{v.canaryRefreshHash, v.canaryAtomicHash} {
+		if hash == "" {
+			continue
+		}
+		if rt, ok, err := v.p.store.GetRefreshToken(v.ctx, hash); err == nil && ok {
 			rt.ExpiresAt = v.now.Add(-time.Hour)
 			rt.FamilyExpiresAt = v.now.Add(-time.Hour)
 			_ = v.p.store.SaveRefreshToken(v.ctx, rt)

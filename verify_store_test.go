@@ -2,6 +2,7 @@ package mcpoauth_test
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -35,23 +36,28 @@ type faultStore struct {
 	pendingByClient map[string]string
 	// savedClients is what keepExpiredClients has to resurrect.
 	savedClients []string
+	// refreshHashes is every hash ever saved, so purgeIgnoresFamilyExpiresAt
+	// can find rows to (wrongly) delete without memstore exposing iteration.
+	refreshHashes map[string]bool
 
-	dropBinderHash      bool
-	dropApproved        bool
-	dropFamilyID        bool
-	dropFamilyCreatedAt bool
-	dropFamilyExpiresAt bool
-	dropSealed          bool
-	deleteOnConsume     bool
-	neverStampConsumed  bool
-	returnRowAfterStamp bool
-	overwriteConsumedAt bool
-	filterExpiredRows   bool
-	linkIsUpsert        bool
-	pendingIsUpsert     bool
-	replayableAuthCode  bool
-	revokeIsNoOp        bool
-	keepExpiredClients  bool
+	dropBinderHash              bool
+	dropApproved                bool
+	dropFamilyID                bool
+	dropFamilyCreatedAt         bool
+	dropFamilyExpiresAt         bool
+	dropSealed                  bool
+	deleteOnConsume             bool
+	neverStampConsumed          bool
+	returnRowAfterStamp         bool
+	overwriteConsumedAt         bool
+	filterExpiredRows           bool
+	nonAtomicConsume            bool
+	linkIsUpsert                bool
+	pendingIsUpsert             bool
+	replayableAuthCode          bool
+	revokeIsNoOp                bool
+	keepExpiredClients          bool
+	purgeIgnoresFamilyExpiresAt bool
 }
 
 func newFaultStore(breakOneRule func(*faultStore)) *faultStore {
@@ -60,6 +66,7 @@ func newFaultStore(breakOneRule func(*faultStore)) *faultStore {
 		stamps:          map[string]time.Time{},
 		gone:            map[string]bool{},
 		pendingByClient: map[string]string{},
+		refreshHashes:   map[string]bool{},
 	}
 	breakOneRule(f)
 	return f
@@ -95,6 +102,11 @@ func (f *faultStore) SaveRefreshToken(ctx context.Context, rt mcpoauth.RefreshTo
 	}
 	if f.dropFamilyExpiresAt {
 		rt.FamilyExpiresAt = time.Time{}
+	}
+	if f.purgeIgnoresFamilyExpiresAt {
+		f.mu.Lock()
+		f.refreshHashes[rt.TokenHash] = true
+		f.mu.Unlock()
 	}
 	return f.Store.SaveRefreshToken(ctx, rt)
 }
@@ -167,6 +179,26 @@ func (f *faultStore) ConsumeRefreshToken(ctx context.Context, hash string, at ti
 			return mcpoauth.RefreshToken{}, false, nil
 		}
 		return rt, ok, err
+
+	case f.nonAtomicConsume:
+		// A SELECT-then-UPDATE (or a read/modify/save ORM call) with no
+		// `FOR UPDATE`: read, yield to widen the race window, THEN write. Every
+		// concurrent caller reads the pre-write state, so all of them see a
+		// zero ConsumedAt and all of them "win".
+		before, ok, err := f.Store.GetRefreshToken(ctx, hash)
+		if err != nil || !ok {
+			return before, ok, err
+		}
+		if before.ConsumedAt.IsZero() {
+			runtime.Gosched()
+			time.Sleep(time.Millisecond)
+			stamped := before
+			stamped.ConsumedAt = at
+			if err := f.Store.SaveRefreshToken(ctx, stamped); err != nil {
+				return mcpoauth.RefreshToken{}, false, err
+			}
+		}
+		return before, true, nil
 	}
 	return f.Store.ConsumeRefreshToken(ctx, hash, at)
 }
@@ -211,6 +243,30 @@ func (f *faultStore) SaveClient(ctx context.Context, c mcpoauth.Client) error {
 }
 
 func (f *faultStore) PurgeExpired(ctx context.Context, before time.Time) error {
+	if f.purgeIgnoresFamilyExpiresAt {
+		// `DELETE ... WHERE expires_at < $1` with the `AND family_expires_at <
+		// $1` guard missing: a row is gone on its own expiry alone, whatever
+		// its family's is. RevokeRefreshTokenFamily deletes by family_id,
+		// which is exactly one row for these canaries, so it stands in for a
+		// single-row DELETE without memstore exposing one.
+		f.mu.Lock()
+		hashes := make([]string, 0, len(f.refreshHashes))
+		for h := range f.refreshHashes {
+			hashes = append(hashes, h)
+		}
+		f.mu.Unlock()
+		for _, h := range hashes {
+			rt, ok, err := f.Store.GetRefreshToken(ctx, h)
+			if err != nil {
+				return err
+			}
+			if ok && rt.ExpiresAt.Before(before) {
+				if err := f.Store.RevokeRefreshTokenFamily(ctx, rt.FamilyID); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	if !f.keepExpiredClients {
 		return f.Store.PurgeExpired(ctx, before)
 	}
@@ -410,6 +466,23 @@ func TestVerifyStore(t *testing.T) {
 			name:    "never purges expired clients",
 			broken:  func(f *faultStore) { f.keepExpiredClients = true },
 			wantMsg: "does not delete expired clients",
+		},
+		{
+			// The blind spot a single-threaded check cannot see at all: a
+			// SELECT-then-UPDATE with no `FOR UPDATE` passes every prior case
+			// because they only ever call ConsumeRefreshToken once at a time.
+			name:    "ConsumeRefreshToken is not atomic under concurrent callers",
+			broken:  func(f *faultStore) { f.nonAtomicConsume = true },
+			wantMsg: "is not atomic",
+		},
+		{
+			// The purge condition without its second half: catches a DELETE
+			// that dropped `AND family_expires_at < $1`, which a fully-expired
+			// row check (the pre-existing "never purges" cases) cannot see
+			// because that row has both conditions true.
+			name:    "PurgeExpired drops the family_expires_at condition",
+			broken:  func(f *faultStore) { f.purgeIgnoresFamilyExpiresAt = true },
+			wantMsg: "`AND family_expires_at < $1`",
 		},
 	}
 
