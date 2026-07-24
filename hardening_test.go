@@ -33,6 +33,9 @@ func TestJWTSecretStrength(t *testing.T) {
 	}
 
 	t.Run("New rejects a weak secret", func(t *testing.T) {
+		// A 32-byte secret is not automatically a good one: the length floor is
+		// a floor, not an entropy measurement, so a repeated or padded
+		// placeholder is rejected on its own account.
 		tests := []struct {
 			name    string
 			secret  []byte
@@ -42,8 +45,13 @@ func TestJWTSecretStrength(t *testing.T) {
 			{"empty", []byte{}, true},
 			{"one byte", []byte("a"), true},
 			{"31 bytes", bytes.Repeat([]byte("x"), 31), true},
-			{"exactly 32 bytes", bytes.Repeat([]byte("x"), 32), false},
-			{"64 bytes", bytes.Repeat([]byte("x"), 64), false},
+			{"31 random-looking bytes", []byte("Kq7-Zt2_Rm9.Xb4~Ld8+Wc1/Yh6*Ng3"), true},
+			{"32 bytes of one repeated byte", bytes.Repeat([]byte("x"), 32), true},
+			{"64 bytes of one repeated byte", bytes.Repeat([]byte("x"), 64), true},
+			{"32 bytes cycling 4 values", bytes.Repeat([]byte("abcd"), 8), true},
+			{"32 bytes cycling exactly 8 values", bytes.Repeat([]byte("abcdefgh"), 4), false},
+			{"exactly 32 varied bytes", []byte("Kq7-Zt2_Rm9.Xb4~Ld8+Wc1/Yh6*Ng35"), false},
+			{"64 varied bytes", bytes.Repeat([]byte("abcdefgh"), 8), false},
 		}
 		for _, tc := range tests {
 			t.Run(tc.name, func(t *testing.T) {
@@ -336,13 +344,22 @@ func TestMethodHandling(t *testing.T) {
 	})
 }
 
-// TestConcurrentCodeDoubleSpend proves the single-use guarantee holds under
-// real concurrency, not just sequentially.
+// TestConcurrentDoubleSpend proves the single-use guarantee holds under real
+// concurrency, not just sequentially.
+//
+// The two grants differ on purpose. An authorization code may only ever be
+// exchanged once: 31 of 32 racers must fail. A refresh token must additionally
+// not punish a client that submitted the same token twice, so the losers of the
+// race are answered with the winner's token (Config.RefreshGracePeriod) — what
+// must hold there is that exactly ONE new token was minted, that every success
+// carries it, and that it is still usable afterwards.
 func TestConcurrentDoubleSpend(t *testing.T) {
 	tests := []struct {
 		name string
 		// setup returns the form that 32 goroutines will race with.
 		setup func(t *testing.T, h *harness) url.Values
+		// check inspects every successful body.
+		check func(t *testing.T, h *harness, form url.Values, ok []tokenSuccess)
 	}{
 		{
 			name: "authorization code",
@@ -352,6 +369,11 @@ func TestConcurrentDoubleSpend(t *testing.T) {
 					"grant_type": {"authorization_code"}, "code": {code},
 					"client_id": {clientID}, "redirect_uri": {testRedirectURI},
 					"code_verifier": {verifier},
+				}
+			},
+			check: func(t *testing.T, _ *harness, _ url.Values, ok []tokenSuccess) {
+				if len(ok) != 1 {
+					t.Fatalf("%d concurrent exchanges succeeded, want exactly 1", len(ok))
 				}
 			},
 		},
@@ -364,6 +386,30 @@ func TestConcurrentDoubleSpend(t *testing.T) {
 					"client_id": {clientID},
 				}
 			},
+			check: func(t *testing.T, h *harness, form url.Values, ok []tokenSuccess) {
+				if len(ok) == 0 {
+					t.Fatal("no concurrent rotation succeeded at all")
+				}
+				distinct := map[string]bool{}
+				for _, s := range ok {
+					distinct[s.RefreshToken] = true
+				}
+				if len(distinct) != 1 {
+					t.Fatalf("%d distinct refresh tokens were issued by one rotation, want 1", len(distinct))
+				}
+				if live := h.store.LiveRefresh(); live != 1 {
+					t.Fatalf("%d unconsumed refresh tokens survive the race, want 1 "+
+						"(a duplicate submission must not revoke the family)", live)
+				}
+				// The survivor is the one every winner was handed, and it works.
+				rec := h.token(url.Values{
+					"grant_type": {"refresh_token"}, "refresh_token": {ok[0].RefreshToken},
+					"client_id": form["client_id"],
+				})
+				if rec.Code != http.StatusOK {
+					t.Fatalf("the token handed out by the race is dead: %d %s", rec.Code, rec.Body.String())
+				}
+			},
 		},
 	}
 
@@ -374,28 +420,26 @@ func TestConcurrentDoubleSpend(t *testing.T) {
 
 			const n = 32
 			var wg sync.WaitGroup
-			results := make([]int, n)
+			results := make([]*httptest.ResponseRecorder, n)
 			start := make(chan struct{})
 			for i := 0; i < n; i++ {
 				wg.Add(1)
 				go func(i int) {
 					defer wg.Done()
 					<-start
-					results[i] = h.token(form).Code
+					results[i] = h.token(form)
 				}(i)
 			}
 			close(start)
 			wg.Wait()
 
-			ok := 0
-			for _, c := range results {
-				if c == http.StatusOK {
-					ok++
+			var ok []tokenSuccess
+			for _, rec := range results {
+				if rec.Code == http.StatusOK {
+					ok = append(ok, decodeJSON[tokenSuccess](t, rec))
 				}
 			}
-			if ok != 1 {
-				t.Fatalf("%d of %d concurrent exchanges succeeded, want exactly 1", ok, n)
-			}
+			tc.check(t, h, form, ok)
 		})
 	}
 }

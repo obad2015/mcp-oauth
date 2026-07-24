@@ -50,6 +50,10 @@ func TestRefreshTokenFamily(t *testing.T) {
 			t.Fatal("the attacker's rotation did not produce a token")
 		}
 
+		// Past the idempotency grace window, so this is a replay and not a
+		// duplicate submission.
+		h.advance(time.Minute)
+
 		// The legitimate client now presents the same token: canonical reuse.
 		replay := rotate(h, clientID, stolen)
 		if replay.Code != http.StatusBadRequest {
@@ -76,6 +80,7 @@ func TestRefreshTokenFamily(t *testing.T) {
 
 		stolen := pairA.RefreshToken
 		_ = decodeJSON[tokenSuccess](t, rotate(h, clientA, stolen))
+		h.advance(time.Minute)
 		if rec := rotate(h, clientA, stolen); rec.Code != http.StatusBadRequest {
 			t.Fatalf("reuse: status = %d, want 400", rec.Code)
 		}

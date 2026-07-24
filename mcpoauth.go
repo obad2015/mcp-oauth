@@ -37,22 +37,9 @@ type Provider struct {
 	now func() time.Time
 
 	mu sync.Mutex
-	// consumed remembers recently rotated refresh-token hashes so a replay
-	// can be attributed to its family. Best effort and per process: a store
-	// may implement stronger, cluster-wide detection on top.
-	consumed map[string]consumedRefresh
 	// lastPurge throttles the opportunistic PurgeExpired call.
 	lastPurge time.Time
 }
-
-type consumedRefresh struct {
-	familyID  string
-	expiresAt time.Time
-}
-
-// maxConsumedLedger bounds the reuse-detection ledger so it can never be grown
-// without limit by an attacker who keeps rotating tokens.
-const maxConsumedLedger = 4096
 
 // New validates cfg and returns a Provider.
 func New(cfg Config, store Store) (*Provider, error) {
@@ -89,12 +76,27 @@ func New(cfg Config, store Store) (*Provider, error) {
 		return nil, fmt.Errorf("mcpoauth: JWTSecret must be at least %d bytes, got %d",
 			minJWTSecretLen, len(cfg.JWTSecret))
 	}
+	if n := distinctBytes(cfg.JWTSecret); n < minJWTSecretDistinct {
+		return nil, fmt.Errorf(
+			"mcpoauth: JWTSecret uses only %d distinct byte values (need at least %d); "+
+				"it must be random, not a repeated or hand-typed string",
+			n, minJWTSecretDistinct)
+	}
 
 	for _, f := range required {
 		if f.name != "Issuer" && !strings.HasSuffix(f.name, "URL") {
 			continue
 		}
 		if err := requireAbsoluteURL(f.name, f.value); err != nil {
+			return nil, err
+		}
+	}
+
+	// InsecureDevMode weakens the browser-binding cookie. It is only ever
+	// coherent for plain-http local development, so refuse it for anything
+	// that looks remotely like a deployment.
+	if cfg.InsecureDevMode {
+		if err := requireLoopbackHTTP("Issuer", cfg.Issuer); err != nil {
 			return nil, err
 		}
 	}
@@ -120,8 +122,17 @@ func New(cfg Config, store Store) (*Provider, error) {
 	if cfg.RefreshTokenAbsoluteTTL <= 0 {
 		cfg.RefreshTokenAbsoluteTTL = 90 * 24 * time.Hour
 	}
-	if cfg.RefreshReuseWindow <= 0 {
-		cfg.RefreshReuseWindow = 24 * time.Hour
+	if cfg.RefreshGracePeriod == 0 {
+		cfg.RefreshGracePeriod = 30 * time.Second
+	}
+	if cfg.RefreshGracePeriod < 0 {
+		cfg.RefreshGracePeriod = 0
+	}
+	if cfg.UnusedClientTTL <= 0 {
+		cfg.UnusedClientTTL = 24 * time.Hour
+	}
+	if cfg.ClientTTL <= 0 {
+		cfg.ClientTTL = 90 * 24 * time.Hour
 	}
 	if cfg.PurgeInterval <= 0 {
 		cfg.PurgeInterval = 5 * time.Minute
@@ -156,12 +167,11 @@ func New(cfg Config, store Store) (*Provider, error) {
 	}
 
 	p := &Provider{
-		cfg:      cfg,
-		store:    store,
-		http:     httpClient,
-		signKey:  deriveSigningKey(cfg.JWTSecret),
-		now:      time.Now,
-		consumed: map[string]consumedRefresh{},
+		cfg:     cfg,
+		store:   store,
+		http:    httpClient,
+		signKey: deriveSigningKey(cfg.JWTSecret),
+		now:     time.Now,
 	}
 	p.jwks = newJWKSCache(cfg.GoogleJWKSURL, httpClient, p.nowFn)
 	return p, nil
@@ -169,8 +179,10 @@ func New(cfg Config, store Store) (*Provider, error) {
 
 func (p *Provider) nowFn() time.Time { return p.now() }
 
-// PurgeExpired deletes every expired authorization code, pending authorization
-// request and refresh token, and prunes the in-process refresh-reuse ledger.
+// PurgeExpired deletes every record whose retention has lapsed: expired
+// authorization codes and pending authorization requests, refresh tokens whose
+// family has died (consumed rows included — they are the reuse-detection
+// ledger), and client registrations that expired unused.
 //
 // The provider also calls it opportunistically (at most once per
 // Config.PurgeInterval) while serving requests, but that is only a backstop:
@@ -186,11 +198,6 @@ func (p *Provider) PurgeExpired(ctx context.Context) error {
 
 	p.mu.Lock()
 	p.lastPurge = now
-	for h, c := range p.consumed {
-		if !now.Before(c.expiresAt) {
-			delete(p.consumed, h)
-		}
-	}
 	p.mu.Unlock()
 
 	if err := p.store.PurgeExpired(ctx, now); err != nil {
@@ -215,52 +222,11 @@ func (p *Provider) maybePurge(ctx context.Context) {
 	_ = p.PurgeExpired(ctx)
 }
 
-// rememberConsumedRefresh records a rotated-away refresh token so a later
-// replay can be attributed to its family.
-func (p *Provider) rememberConsumedRefresh(tokenHash, familyID string, now time.Time) {
-	if familyID == "" {
-		return
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if len(p.consumed) >= maxConsumedLedger {
-		for h, c := range p.consumed {
-			if !now.Before(c.expiresAt) {
-				delete(p.consumed, h)
-			}
-		}
-		// Still full: drop arbitrary entries rather than grow without bound.
-		for h := range p.consumed {
-			if len(p.consumed) < maxConsumedLedger {
-				break
-			}
-			delete(p.consumed, h)
-		}
-	}
-	p.consumed[tokenHash] = consumedRefresh{
-		familyID:  familyID,
-		expiresAt: now.Add(p.cfg.RefreshReuseWindow),
-	}
-}
-
-// familyOfConsumedRefresh reports the family of a refresh token that was
-// already rotated away, if it is still inside the reuse window.
-func (p *Provider) familyOfConsumedRefresh(tokenHash string, now time.Time) (string, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	c, ok := p.consumed[tokenHash]
-	if !ok {
-		return "", false
-	}
-	if !now.Before(c.expiresAt) {
-		delete(p.consumed, tokenHash)
-		return "", false
-	}
-	return c.familyID, true
-}
-
 // --- browser binding -----------------------------------------------------
+
+// maxBinders is how many concurrent authorization flows one browser can hold
+// binders for. Older values fall off the end of the cookie.
+const maxBinders = 5
 
 // binderCookieName is __Host-prefixed unless the provider is in dev mode.
 func (p *Provider) binderCookieName() string {
@@ -270,32 +236,69 @@ func (p *Provider) binderCookieName() string {
 	return BinderCookieName
 }
 
-// setBinderCookie issues the browser-binding cookie. SameSite=Lax is required
-// (not Strict): the cookie has to survive the top-level GET redirect back from
-// Google.
-func (p *Provider) setBinderCookie(w http.ResponseWriter, value string) {
-	http.SetCookie(w, &http.Cookie{
+// readBinders returns the binder values the request carries, newest first.
+func (p *Provider) readBinders(r *http.Request) []string {
+	c, err := r.Cookie(p.binderCookieName())
+	if err != nil || c.Value == "" {
+		return nil
+	}
+	// SplitN, not Split: an oversized cookie must not be exploded into a huge
+	// slice. Anything past the cap lands in the final element, which simply
+	// never matches a binder hash.
+	out := make([]string, 0, maxBinders)
+	for _, v := range strings.SplitN(c.Value, BinderCookieSep, maxBinders+1) {
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+		if len(out) == maxBinders {
+			break
+		}
+	}
+	return out
+}
+
+// writeBinderCookie stores values (newest first) in the binding cookie.
+// SameSite=Lax is required (not Strict): the cookie has to survive the
+// top-level GET redirect back from Google.
+func (p *Provider) writeBinderCookie(w http.ResponseWriter, values []string) {
+	c := &http.Cookie{
 		Name:     p.binderCookieName(),
-		Value:    value,
+		Value:    strings.Join(values, BinderCookieSep),
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   !p.cfg.InsecureDevMode,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(p.cfg.PendingAuthTTL.Seconds()),
-	})
+	}
+	if len(values) == 0 {
+		c.MaxAge = -1
+	}
+	http.SetCookie(w, c)
 }
 
-// clearBinderCookie expires the binding cookie once the flow is over.
-func (p *Provider) clearBinderCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     p.binderCookieName(),
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   !p.cfg.InsecureDevMode,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
+// addBinder prepends a new binder to whatever the browser already holds, so a
+// second authorization flow in the same browser does not invalidate the first.
+func (p *Provider) addBinder(w http.ResponseWriter, r *http.Request, value string) {
+	values := append([]string{value}, p.readBinders(r)...)
+	if len(values) > maxBinders {
+		values = values[:maxBinders]
+	}
+	p.writeBinderCookie(w, values)
+}
+
+// dropBinder removes the binder a finished flow was pinned to (identified by
+// its hash, which is all the pending record holds) and leaves any other tab's
+// binder in place.
+func (p *Provider) dropBinder(w http.ResponseWriter, r *http.Request, usedHash string) {
+	kept := make([]string, 0, maxBinders)
+	for _, v := range p.readBinders(r) {
+		if usedHash != "" && subtle.ConstantTimeCompare([]byte(HashSecret(v)), []byte(usedHash)) == 1 {
+			continue
+		}
+		kept = append(kept, v)
+	}
+	p.writeBinderCookie(w, kept)
 }
 
 // binderMatches reports whether the request carries the binding cookie that
@@ -305,11 +308,14 @@ func (p *Provider) binderMatches(r *http.Request, wantHash string) bool {
 	if wantHash == "" {
 		return false
 	}
-	c, err := r.Cookie(p.binderCookieName())
-	if err != nil || c.Value == "" {
-		return false
+	match := false
+	for _, v := range p.readBinders(r) {
+		// No early exit: every candidate is compared in constant time.
+		if subtle.ConstantTimeCompare([]byte(HashSecret(v)), []byte(wantHash)) == 1 {
+			match = true
+		}
 	}
-	return subtle.ConstantTimeCompare([]byte(HashSecret(c.Value)), []byte(wantHash)) == 1
+	return match
 }
 
 func requireAbsoluteURL(name, raw string) error {
@@ -321,6 +327,35 @@ func requireAbsoluteURL(name, raw string) error {
 		return fmt.Errorf("mcpoauth: %s must be an absolute URL, got %q", name, raw)
 	}
 	return nil
+}
+
+// requireLoopbackHTTP rejects anything that is not plain http on a loopback
+// host. It gates Config.InsecureDevMode.
+func requireLoopbackHTTP(name, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("mcpoauth: InsecureDevMode requires a loopback http:// %s, got %q", name, raw)
+	}
+	if !strings.EqualFold(u.Scheme, "http") || !isLoopbackHost(u.Hostname()) {
+		return fmt.Errorf(
+			"mcpoauth: InsecureDevMode is for plain-http local development only, "+
+				"but %s is %q; it must be http:// on 127.0.0.1, [::1] or localhost",
+			name, raw)
+	}
+	return nil
+}
+
+// distinctBytes counts how many different byte values appear in b.
+func distinctBytes(b []byte) int {
+	var seen [256]bool
+	n := 0
+	for _, c := range b {
+		if !seen[c] {
+			seen[c] = true
+			n++
+		}
+	}
+	return n
 }
 
 // ProtectedResourceMetadataURL is the absolute URL of the RFC 9728 document,

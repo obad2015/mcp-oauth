@@ -95,12 +95,44 @@ func (s *MemoryStore) SaveRefreshToken(_ context.Context, rt mcpoauth.RefreshTok
 	return nil
 }
 
-func (s *MemoryStore) ConsumeRefreshToken(_ context.Context, tokenHash string) (mcpoauth.RefreshToken, bool, error) {
+func (s *MemoryStore) GetRefreshToken(_ context.Context, tokenHash string) (mcpoauth.RefreshToken, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rt, ok := s.refresh[tokenHash]
-	delete(s.refresh, tokenHash)
 	return rt, ok, nil
+}
+
+// ConsumeRefreshToken stamps ConsumedAt and returns the row as it was before.
+// The row is deliberately kept: it is the durable reuse-detection ledger, and
+// only PurgeExpired removes it.
+func (s *MemoryStore) ConsumeRefreshToken(_ context.Context, tokenHash string, consumedAt time.Time) (mcpoauth.RefreshToken, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	before, ok := s.refresh[tokenHash]
+	if !ok {
+		return mcpoauth.RefreshToken{}, false, nil
+	}
+	if before.ConsumedAt.IsZero() {
+		stamped := before
+		stamped.ConsumedAt = consumedAt
+		s.refresh[tokenHash] = stamped
+	}
+	return before, true, nil
+}
+
+// LinkRefreshSuccessor attaches the sealed successor to a consumed row and
+// re-stamps its family.
+func (s *MemoryStore) LinkRefreshSuccessor(_ context.Context, tokenHash, familyID string, sealed []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rt, ok := s.refresh[tokenHash]
+	if !ok {
+		return nil
+	}
+	rt.FamilyID = familyID
+	rt.SuccessorSealed = sealed
+	s.refresh[tokenHash] = rt
+	return nil
 }
 
 func (s *MemoryStore) RevokeRefreshTokensForUser(_ context.Context, userID string) error {
@@ -130,8 +162,13 @@ func (s *MemoryStore) RevokeRefreshTokenFamily(_ context.Context, familyID strin
 	return nil
 }
 
-// PurgeExpired drops every expired record. Records with a zero ExpiresAt are
-// treated as already expired: nothing this package writes leaves it unset.
+// PurgeExpired drops every record whose retention has lapsed. Records with a
+// zero ExpiresAt are treated as already expired: nothing this package writes
+// leaves it unset.
+//
+// A refresh token survives until BOTH its own expiry and its family's have
+// passed — a consumed row is the reuse-detection ledger and must outlive the
+// token itself.
 func (s *MemoryStore) PurgeExpired(_ context.Context, before time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,19 +183,38 @@ func (s *MemoryStore) PurgeExpired(_ context.Context, before time.Time) error {
 		}
 	}
 	for h, rt := range s.refresh {
-		if rt.ExpiresAt.Before(before) {
+		if rt.ExpiresAt.Before(before) && rt.FamilyExpiresAt.Before(before) {
 			delete(s.refresh, h)
+		}
+	}
+	for id, c := range s.clients {
+		if c.ExpiresAt.Before(before) {
+			delete(s.clients, id)
 		}
 	}
 	return nil
 }
 
-// Len reports how many live records of each kind the store holds. Exported for
-// tests and local debugging.
+// Len reports how many records of each kind the store holds, consumed refresh
+// tokens included. Exported for tests and local debugging.
 func (s *MemoryStore) Len() (clients, codes, pending, refresh int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.clients), len(s.codes), len(s.pending), len(s.refresh)
+}
+
+// LiveRefresh reports how many refresh tokens are still usable — rows that
+// have not been consumed. Exported for tests and local debugging.
+func (s *MemoryStore) LiveRefresh() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, rt := range s.refresh {
+		if rt.ConsumedAt.IsZero() {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *MemoryStore) FindUserIDByEmail(_ context.Context, email string) (string, bool, error) {
