@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +46,7 @@ type fakeGoogle struct {
 
 	emailVerified bool
 	tokenStatus   int
+	certsStatus   int
 	audience      string
 	issuer        string
 	expiresIn     time.Duration
@@ -75,6 +77,7 @@ func newFakeGoogle(t *testing.T) *fakeGoogle {
 		emails:        map[string]string{},
 		emailVerified: true,
 		tokenStatus:   http.StatusOK,
+		certsStatus:   http.StatusOK,
 		audience:      testGoogleCID,
 		issuer:        "https://accounts.google.com",
 		expiresIn:     time.Hour,
@@ -140,6 +143,10 @@ func (g *fakeGoogle) handleToken(w http.ResponseWriter, r *http.Request) {
 
 func (g *fakeGoogle) handleCerts(w http.ResponseWriter, _ *http.Request) {
 	g.jwksCalls++
+	if g.certsStatus != http.StatusOK {
+		w.WriteHeader(g.certsStatus)
+		return
+	}
 	pub := g.key.Public().(*rsa.PublicKey)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "public, max-age=3600")
@@ -162,7 +169,15 @@ type harness struct {
 	p      *mcpoauth.Provider
 	store  *memstore.MemoryStore
 	google *fakeGoogle
+
+	// binder is the browser-binding cookie handed out by the last authorize
+	// GET, replayed by callback() the way a real browser would.
+	binder *http.Cookie
 }
+
+// signingKey is the key access tokens are actually signed with: the configured
+// secret is never used directly (HKDF key separation).
+func signingKey() []byte { return mcpoauth.DeriveSigningKeyForTest(testSecret) }
 
 func newHarness(t *testing.T, tweak ...func(*mcpoauth.Config)) *harness {
 	t.Helper()
@@ -199,9 +214,15 @@ func newHarness(t *testing.T, tweak ...func(*mcpoauth.Config)) *harness {
 // register runs dynamic client registration and returns the client_id.
 func (h *harness) register(redirectURIs ...string) string {
 	h.t.Helper()
+	return h.registerNamed("Test MCP Client", redirectURIs...)
+}
+
+// registerNamed is register with an explicit (possibly hostile) client_name.
+func (h *harness) registerNamed(name string, redirectURIs ...string) string {
+	h.t.Helper()
 	body, _ := json.Marshal(map[string]any{
 		"redirect_uris": redirectURIs,
-		"client_name":   "Test MCP Client",
+		"client_name":   name,
 	})
 	rec := httptest.NewRecorder()
 	h.p.Register()(rec, httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(string(body))))
@@ -217,12 +238,41 @@ func (h *harness) register(redirectURIs ...string) string {
 	return resp.ClientID
 }
 
-// authorize calls the authorize endpoint and returns the recorder plus the
-// opaque state value handed to Google (empty when the request was rejected).
-func (h *harness) authorize(params url.Values) (*httptest.ResponseRecorder, string) {
+// authorizeGET performs only the first leg: the interstitial consent page.
+func (h *harness) authorizeGET(params url.Values) *httptest.ResponseRecorder {
 	h.t.Helper()
 	rec := httptest.NewRecorder()
 	h.p.Authorize()(rec, httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil))
+	if c := binderCookie(rec); c != nil {
+		h.binder = c
+	}
+	return rec
+}
+
+// approve posts the consent form back, optionally with a different cookie than
+// the one the consent page set (nil = send none).
+func (h *harness) approve(nonce string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	h.t.Helper()
+	req := postForm("/authorize", url.Values{consentNonceField: {nonce}})
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	h.p.Authorize()(rec, req)
+	return rec
+}
+
+// authorize runs the whole authorization leg the way a browser does — GET the
+// consent page, POST the approval — and returns the final recorder plus the
+// opaque state handed to Google (empty when the request was rejected).
+func (h *harness) authorize(params url.Values) (*httptest.ResponseRecorder, string) {
+	h.t.Helper()
+	get := h.authorizeGET(params)
+	if get.Code != http.StatusOK {
+		return get, ""
+	}
+	nonce := consentNonce(h.t, get.Body.String())
+	rec := h.approve(nonce, h.binder)
 	if rec.Code != http.StatusFound {
 		return rec, ""
 	}
@@ -233,13 +283,64 @@ func (h *harness) authorize(params url.Values) (*httptest.ResponseRecorder, stri
 	return rec, loc.Query().Get("state")
 }
 
-// callback runs the Google callback for an upstream code + our state.
+// otherFlowNonce starts a second, unrelated authorization flow and returns its
+// consent nonce, leaving the harness's own binder cookie untouched.
+func (h *harness) otherFlowNonce(t *testing.T) string {
+	t.Helper()
+	saved := h.binder
+	defer func() { h.binder = saved }()
+	get := h.authorizeGET(authorizeParams(h.register(testRedirectURI), testRedirectURI))
+	return consentNonce(t, get.Body.String())
+}
+
+// callback runs the Google callback for an upstream code + our state, carrying
+// the binder cookie the same browser would.
 func (h *harness) callback(state, googleCode string) *httptest.ResponseRecorder {
 	h.t.Helper()
+	return h.callbackWithCookie(state, googleCode, h.binder)
+}
+
+// callbackWithCookie is callback() with an explicit binding cookie (nil sends
+// none), which is how the cross-browser hijack is simulated.
+func (h *harness) callbackWithCookie(state, googleCode string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	h.t.Helper()
 	q := url.Values{"state": {state}, "code": {googleCode}}
+	req := httptest.NewRequest(http.MethodGet, "/callback?"+q.Encode(), nil)
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
 	rec := httptest.NewRecorder()
-	h.p.GoogleCallback()(rec, httptest.NewRequest(http.MethodGet, "/callback?"+q.Encode(), nil))
+	h.p.GoogleCallback()(rec, req)
 	return rec
+}
+
+// consentNonceField mirrors mcpoauth.ConsentNonceField for brevity in tests.
+const consentNonceField = mcpoauth.ConsentNonceField
+
+// binderCookie extracts the browser-binding cookie from a response, if set.
+func binderCookie(rec *httptest.ResponseRecorder) *http.Cookie {
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == mcpoauth.BinderCookieName || c.Name == mcpoauth.BinderCookieNameInsecure {
+			if c.Value == "" {
+				return nil // a clearing cookie
+			}
+			return c
+		}
+	}
+	return nil
+}
+
+var consentNonceRE = regexp.MustCompile(
+	`name="` + regexp.QuoteMeta(mcpoauth.ConsentNonceField) + `" value="([^"]+)"`)
+
+// consentNonce scrapes the single-use nonce out of the default consent page.
+func consentNonce(t *testing.T, page string) string {
+	t.Helper()
+	m := consentNonceRE.FindStringSubmatch(page)
+	if m == nil {
+		t.Fatalf("no consent nonce in page:\n%s", page)
+	}
+	return m[1]
 }
 
 // token posts to the token endpoint.

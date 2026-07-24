@@ -129,6 +129,12 @@ func newJWKSCache(jwksURL string, client *http.Client, now func() time.Time) *jw
 	return &jwksCache{url: jwksURL, client: client, now: now}
 }
 
+// maxStaleJWKS bounds how far past its advertised expiry a cached signing key
+// may still be used when the JWKS endpoint is unreachable. Beyond that we fail
+// closed: a key that Google rotated away days ago must not keep authenticating
+// logins just because we cannot reach the endpoint.
+const maxStaleJWKS = 24 * time.Hour
+
 // key returns the RSA public key for kid, refreshing the cache when the key is
 // unknown or the cached document has expired.
 func (c *jwksCache) key(ctx context.Context, kid string) (*rsa.PublicKey, error) {
@@ -138,18 +144,22 @@ func (c *jwksCache) key(ctx context.Context, kid string) (*rsa.PublicKey, error)
 
 	c.mu.Lock()
 	k, ok := c.keys[kid]
-	fresh := c.now().Before(c.expiresAt)
+	expiresAt := c.expiresAt
 	c.mu.Unlock()
-	if ok && fresh {
+	if ok && c.now().Before(expiresAt) {
 		return k, nil
 	}
 
 	keys, ttl, err := c.fetch(ctx)
 	if err != nil {
 		// Fall back to a stale-but-known key rather than failing a login on a
-		// transient JWKS outage.
-		if ok {
+		// transient JWKS outage — but only for a bounded grace period.
+		if ok && c.now().Before(expiresAt.Add(maxStaleJWKS)) {
 			return k, nil
+		}
+		if ok {
+			return nil, fmt.Errorf("google signing keys are unreachable and the cached copy is more than %s stale: %w",
+				maxStaleJWKS, err)
 		}
 		return nil, err
 	}

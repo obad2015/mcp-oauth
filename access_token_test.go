@@ -47,7 +47,7 @@ func TestValidateAccessToken(t *testing.T) {
 	}{
 		{
 			name:    "valid token",
-			token:   func(t *testing.T) string { return mintToken(t, testSecret, jwt.SigningMethodHS256, validClaims()) },
+			token:   func(t *testing.T) string { return mintToken(t, signingKey(), jwt.SigningMethodHS256, validClaims()) },
 			wantErr: false,
 		},
 		{
@@ -55,7 +55,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				c["aud"] = "https://app.example.com/api/other"
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -64,7 +64,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				delete(c, "aud")
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -73,7 +73,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				c["iss"] = "https://evil.example.com"
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -82,7 +82,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				c["exp"] = time.Now().Add(-time.Minute).Unix()
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -91,7 +91,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				delete(c, "exp")
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -102,7 +102,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				c["token_use"] = "web_session"
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -111,7 +111,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				delete(c, "token_use")
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -125,7 +125,7 @@ func TestValidateAccessToken(t *testing.T) {
 		{
 			name: "alg none",
 			token: func(t *testing.T) string {
-				return mintToken(t, testSecret, jwt.SigningMethodNone, validClaims())
+				return mintToken(t, signingKey(), jwt.SigningMethodNone, validClaims())
 			},
 			wantErr: true,
 		},
@@ -134,7 +134,7 @@ func TestValidateAccessToken(t *testing.T) {
 			token: func(t *testing.T) string {
 				c := validClaims()
 				c["sub"] = ""
-				return mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantErr: true,
 		},
@@ -173,7 +173,7 @@ func TestValidateAccessToken(t *testing.T) {
 		h := newHarness(t)
 		c := validClaims()
 		c["token_use"] = "web_session"
-		_, err := h.p.ValidateAccessToken(mintToken(t, testSecret, jwt.SigningMethodHS256, c))
+		_, err := h.p.ValidateAccessToken(mintToken(t, signingKey(), jwt.SigningMethodHS256, c))
 		if !errors.Is(err, mcpoauth.ErrWrongTokenUse) {
 			t.Fatalf("error = %v, want ErrWrongTokenUse", err)
 		}
@@ -202,14 +202,14 @@ func TestMiddleware(t *testing.T) {
 		{
 			name: "valid bearer token",
 			header: func(t *testing.T) string {
-				return "Bearer " + mintToken(t, testSecret, jwt.SigningMethodHS256, validClaims())
+				return "Bearer " + mintToken(t, signingKey(), jwt.SigningMethodHS256, validClaims())
 			},
 			wantCode: http.StatusOK,
 		},
 		{
 			name: "lowercase scheme",
 			header: func(t *testing.T) string {
-				return "bearer " + mintToken(t, testSecret, jwt.SigningMethodHS256, validClaims())
+				return "bearer " + mintToken(t, signingKey(), jwt.SigningMethodHS256, validClaims())
 			},
 			wantCode: http.StatusOK,
 		},
@@ -238,7 +238,7 @@ func TestMiddleware(t *testing.T) {
 			header: func(t *testing.T) string {
 				c := validClaims()
 				c["token_use"] = "web_session"
-				return "Bearer " + mintToken(t, testSecret, jwt.SigningMethodHS256, c)
+				return "Bearer " + mintToken(t, signingKey(), jwt.SigningMethodHS256, c)
 			},
 			wantCode: http.StatusUnauthorized,
 		},

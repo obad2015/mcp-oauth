@@ -289,6 +289,17 @@ func TestRefreshTokenGrant(t *testing.T) {
 			t.Fatalf("new access token invalid: userID = %q, err = %v", userID, err)
 		}
 
+		// The freshly issued one still works. (Checked before the replay:
+		// replaying a rotated token now revokes the whole family — see
+		// TestRefreshTokenFamily.)
+		if rec := h.token(url.Values{
+			"grant_type":    {"refresh_token"},
+			"refresh_token": {second.RefreshToken},
+			"client_id":     {clientID},
+		}); rec.Code != http.StatusOK {
+			t.Fatalf("second refresh: status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+
 		// The rotated-away token must be dead.
 		replay := h.token(url.Values{
 			"grant_type":    {"refresh_token"},
@@ -300,15 +311,6 @@ func TestRefreshTokenGrant(t *testing.T) {
 		}
 		if got := decodeJSON[errorBody](t, replay).Error; got != "invalid_grant" {
 			t.Fatalf("replay error = %q, want invalid_grant", got)
-		}
-
-		// The freshly issued one still works.
-		if rec := h.token(url.Values{
-			"grant_type":    {"refresh_token"},
-			"refresh_token": {second.RefreshToken},
-			"client_id":     {clientID},
-		}); rec.Code != http.StatusOK {
-			t.Fatalf("second refresh: status = %d, body = %s", rec.Code, rec.Body.String())
 		}
 	})
 
@@ -582,8 +584,10 @@ func TestGoogleCallback(t *testing.T) {
 		})
 
 		q := url.Values{"state": {state}, "error": {"access_denied"}}
+		req := httptest.NewRequest(http.MethodGet, "/callback?"+q.Encode(), nil)
+		req.AddCookie(h.binder) // the same browser comes back
 		rec := httptest.NewRecorder()
-		h.p.GoogleCallback()(rec, httptest.NewRequest(http.MethodGet, "/callback?"+q.Encode(), nil))
+		h.p.GoogleCallback()(rec, req)
 		if rec.Code != http.StatusFound {
 			t.Fatalf("status = %d, want 302", rec.Code)
 		}

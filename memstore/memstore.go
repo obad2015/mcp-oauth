@@ -8,6 +8,7 @@ import (
 	"context"
 	"strings"
 	"sync"
+	"time"
 
 	mcpoauth "github.com/obad2015/mcp-oauth"
 )
@@ -111,6 +112,53 @@ func (s *MemoryStore) RevokeRefreshTokensForUser(_ context.Context, userID strin
 		}
 	}
 	return nil
+}
+
+// RevokeRefreshTokenFamily drops every token in one rotation chain. Called on
+// refresh-token reuse detection.
+func (s *MemoryStore) RevokeRefreshTokenFamily(_ context.Context, familyID string) error {
+	if familyID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h, rt := range s.refresh {
+		if rt.FamilyID == familyID {
+			delete(s.refresh, h)
+		}
+	}
+	return nil
+}
+
+// PurgeExpired drops every expired record. Records with a zero ExpiresAt are
+// treated as already expired: nothing this package writes leaves it unset.
+func (s *MemoryStore) PurgeExpired(_ context.Context, before time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h, c := range s.codes {
+		if c.ExpiresAt.Before(before) {
+			delete(s.codes, h)
+		}
+	}
+	for h, p := range s.pending {
+		if p.ExpiresAt.Before(before) {
+			delete(s.pending, h)
+		}
+	}
+	for h, rt := range s.refresh {
+		if rt.ExpiresAt.Before(before) {
+			delete(s.refresh, h)
+		}
+	}
+	return nil
+}
+
+// Len reports how many live records of each kind the store holds. Exported for
+// tests and local debugging.
+func (s *MemoryStore) Len() (clients, codes, pending, refresh int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.clients), len(s.codes), len(s.pending), len(s.refresh)
 }
 
 func (s *MemoryStore) FindUserIDByEmail(_ context.Context, email string) (string, bool, error) {

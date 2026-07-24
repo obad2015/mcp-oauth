@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ProtectedResourceMetadata serves the RFC 9728 protected-resource metadata
@@ -19,6 +20,10 @@ import (
 func (p *Provider) ProtectedResourceMetadata() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if allowCORS(w, r, http.MethodGet) {
+			return
+		}
+		if !isReadMethod(r.Method) {
+			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "GET required")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -38,6 +43,10 @@ func (p *Provider) AuthorizationServerMetadata() http.HandlerFunc {
 		if allowCORS(w, r, http.MethodGet) {
 			return
 		}
+		if !isReadMethod(r.Method) {
+			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "GET required")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"issuer":                                p.cfg.Issuer,
 			"authorization_endpoint":                p.cfg.AuthorizeURL,
@@ -50,6 +59,12 @@ func (p *Provider) AuthorizationServerMetadata() http.HandlerFunc {
 			"scopes_supported":                      []string{"openid", "email", "profile"},
 		})
 	}
+}
+
+// isReadMethod reports whether the method is one a metadata document may be
+// served for.
+func isReadMethod(m string) bool {
+	return m == http.MethodGet || m == http.MethodHead
 }
 
 // --- dynamic client registration (RFC 7591) ------------------------------
@@ -70,6 +85,7 @@ type registrationResponse struct {
 
 const (
 	maxRedirectURIs      = 10
+	maxRedirectURILen    = 2048
 	maxClientNameLen     = 200
 	maxRegistrationBytes = 16 << 10
 )
@@ -103,13 +119,22 @@ func (p *Provider) Register() http.HandlerFunc {
 			return
 		}
 		for _, u := range req.RedirectURIs {
+			if len(u) > maxRedirectURILen {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", "redirect_uri is too long")
+				return
+			}
 			if err := ValidateRedirectURI(u); err != nil {
+				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
+				return
+			}
+			if err := p.checkRedirectHostPolicy(u); err != nil {
 				writeOAuthError(w, http.StatusBadRequest, "invalid_redirect_uri", err.Error())
 				return
 			}
 		}
 		if len(req.ClientName) > maxClientNameLen {
-			req.ClientName = req.ClientName[:maxClientNameLen]
+			writeOAuthError(w, http.StatusBadRequest, "invalid_client_metadata", "client_name is too long")
+			return
 		}
 
 		clientID, err := randomToken(24)
@@ -174,6 +199,32 @@ func ValidateRedirectURI(raw string) error {
 	}
 }
 
+// checkRedirectHostPolicy applies Config.AllowedRedirectHosts on top of
+// ValidateRedirectURI. Loopback http URIs are always allowed — MCP CLI clients
+// listen on a random loopback port and cannot be enumerated in advance. When
+// the allowlist is empty the policy is a no-op.
+//
+// It assumes ValidateRedirectURI already accepted raw.
+func (p *Provider) checkRedirectHostPolicy(raw string) error {
+	if len(p.cfg.AllowedRedirectHosts) == 0 {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("redirect_uri is not a valid URL")
+	}
+	host := strings.ToLower(u.Hostname())
+	if strings.EqualFold(u.Scheme, "http") && isLoopbackHost(host) {
+		return nil
+	}
+	for _, allowed := range p.cfg.AllowedRedirectHosts {
+		if host == allowed {
+			return nil
+		}
+	}
+	return errors.New("redirect_uri host is not allowed by this deployment")
+}
+
 func isLoopbackHost(host string) bool {
 	if strings.EqualFold(host, "localhost") {
 		return true
@@ -184,8 +235,29 @@ func isLoopbackHost(host string) bool {
 
 // --- authorize -----------------------------------------------------------
 
-// Authorize starts the flow: it validates the client's request and bounces the
-// browser to Google.
+// maxClientStateLen bounds the client's own `state` parameter, which is stored
+// verbatim and echoed back on the redirect.
+const maxClientStateLen = 512
+
+// maxConsentFormBytes bounds the approval POST body.
+const maxConsentFormBytes = 8 << 10
+
+// Authorize is the authorization endpoint. It handles two methods and mounts as
+// ONE route:
+//
+//   - GET renders an interstitial consent page naming the client and the exact
+//     redirect URI the authorization code would be delivered to. It does NOT
+//     redirect to Google, and the pending record it creates cannot complete a
+//     login on its own.
+//   - POST carries the single-use consent nonce from that page back, and only
+//     then is the browser bounced to Google.
+//
+// Both steps are pinned to the browser with a binding cookie whose hash is
+// stored on the pending record; the Google callback refuses to hand out an
+// authorization code to a different browser. Together these stop the
+// attacker-initiated flow where a victim is phished with a legitimate-looking
+// accounts.google.com link belonging to an attacker-registered client (PKCE
+// cannot help there: the attacker owns both halves of the verifier).
 //
 // Any failure that involves an unknown client or a redirect URI that is not
 // exactly registered is answered with a direct 400 — never a redirect — so this
@@ -194,81 +266,179 @@ func isLoopbackHost(host string) bool {
 // answered directly.
 func (p *Provider) Authorize() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "GET required")
-			return
+		switch r.Method {
+		case http.MethodGet:
+			p.authorizeConsent(w, r)
+		case http.MethodPost:
+			p.authorizeApprove(w, r)
+		default:
+			// HEAD included on purpose: it must not mint or persist anything.
+			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "GET or POST required")
 		}
-		q := r.URL.Query()
-
-		clientID := q.Get("client_id")
-		redirectURI := q.Get("redirect_uri")
-		if clientID == "" || redirectURI == "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client_id and redirect_uri are required")
-			return
-		}
-
-		client, ok, err := p.store.GetClient(r.Context(), clientID)
-		if err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load client")
-			return
-		}
-		if !ok {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
-			return
-		}
-		if !client.HasRedirectURI(redirectURI) {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri is not registered for this client")
-			return
-		}
-
-		// From here the redirect_uri is trusted, but we still answer directly.
-		if rt := q.Get("response_type"); rt != "code" {
-			writeOAuthError(w, http.StatusBadRequest, "unsupported_response_type", "only response_type=code is supported")
-			return
-		}
-		challenge := q.Get("code_challenge")
-		if challenge == "" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required (PKCE)")
-			return
-		}
-		if m := q.Get("code_challenge_method"); m != "S256" {
-			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
-			return
-		}
-
-		state, err := randomToken(32)
-		if err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not generate state")
-			return
-		}
-		now := p.now()
-		pending := PendingAuth{
-			StateHash:     HashSecret(state),
-			ClientID:      client.ClientID,
-			RedirectURI:   redirectURI,
-			CodeChallenge: challenge,
-			ClientState:   q.Get("state"),
-			ExpiresAt:     now.Add(p.cfg.PendingAuthTTL),
-			CreatedAt:     now,
-		}
-		if err := p.store.SavePendingAuth(r.Context(), pending); err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist authorization request")
-			return
-		}
-
-		google := p.cfg.GoogleAuthURL + "?" + url.Values{
-			"client_id":     {p.cfg.GoogleClientID},
-			"redirect_uri":  {p.cfg.GoogleRedirectURL},
-			"response_type": {"code"},
-			"scope":         {GrantedScope},
-			"state":         {state},
-			"access_type":   {"offline"},
-			"prompt":        {"select_account"},
-		}.Encode()
-
-		w.Header().Set("Cache-Control", "no-store")
-		http.Redirect(w, r, google, http.StatusFound)
 	}
+}
+
+// authorizeConsent validates the authorization request and renders the approval
+// page. The pending record it writes is keyed by the consent nonce and is not
+// approved, so it is worthless to anyone who does not complete the POST from
+// the same browser.
+func (p *Provider) authorizeConsent(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	clientID := q.Get("client_id")
+	redirectURI := q.Get("redirect_uri")
+	if clientID == "" || redirectURI == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "client_id and redirect_uri are required")
+		return
+	}
+
+	client, ok, err := p.store.GetClient(r.Context(), clientID)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load client")
+		return
+	}
+	if !ok {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_client", "unknown client_id")
+		return
+	}
+	if !client.HasRedirectURI(redirectURI) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri is not registered for this client")
+		return
+	}
+	// Re-checked here and not only at registration, so that tightening
+	// AllowedRedirectHosts takes effect for clients registered earlier.
+	if err := p.checkRedirectHostPolicy(redirectURI); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+
+	// From here the redirect_uri is trusted, but we still answer directly.
+	if rt := q.Get("response_type"); rt != "code" {
+		writeOAuthError(w, http.StatusBadRequest, "unsupported_response_type", "only response_type=code is supported")
+		return
+	}
+	challenge := q.Get("code_challenge")
+	if challenge == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge is required (PKCE)")
+		return
+	}
+	if err := validateCodeChallenge(challenge); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if m := q.Get("code_challenge_method"); m != "S256" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
+		return
+	}
+	clientState := q.Get("state")
+	if len(clientState) > maxClientStateLen {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "state is too long")
+		return
+	}
+
+	p.maybePurge(r.Context())
+
+	// The nonce identifies the pending record until it is approved; the binder
+	// pins the whole flow to this browser.
+	nonce, err := randomToken(32)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not generate consent nonce")
+		return
+	}
+	binder, err := randomToken(32)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not generate browser binding")
+		return
+	}
+
+	now := p.now()
+	if err := p.store.SavePendingAuth(r.Context(), PendingAuth{
+		StateHash:     HashSecret(nonce),
+		ClientID:      client.ClientID,
+		RedirectURI:   redirectURI,
+		CodeChallenge: challenge,
+		ClientState:   clientState,
+		BinderHash:    HashSecret(binder),
+		Approved:      false,
+		ExpiresAt:     now.Add(p.cfg.PendingAuthTTL),
+		CreatedAt:     now,
+	}); err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist authorization request")
+		return
+	}
+
+	p.setBinderCookie(w, binder)
+	p.renderConsent(w, r, client, ConsentRequest{
+		RedirectURI: redirectURI,
+		Scopes:      strings.Fields(GrantedScope),
+		FormAction:  p.cfg.AuthorizeURL,
+		NonceField:  ConsentNonceField,
+		Nonce:       nonce,
+	})
+}
+
+// authorizeApprove completes the consent step and starts the Google hop.
+func (p *Provider) authorizeApprove(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxConsentFormBytes)
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
+		return
+	}
+	nonce := r.PostFormValue(ConsentNonceField)
+	if nonce == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "missing consent nonce")
+		return
+	}
+
+	// Single-use: the nonce is burned whether or not the rest succeeds.
+	pending, ok, err := p.store.ConsumePendingAuth(r.Context(), HashSecret(nonce))
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load authorization request")
+		return
+	}
+	if !ok || pending.Approved {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+			"consent nonce is unknown, expired or already used")
+		return
+	}
+	if !p.now().Before(pending.ExpiresAt) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "authorization request expired")
+		return
+	}
+	if !p.binderMatches(r, pending.BinderHash) {
+		p.clearBinderCookie(w)
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+			"this approval did not come from the browser that started the authorization request")
+		return
+	}
+
+	state, err := randomToken(32)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not generate state")
+		return
+	}
+	now := p.now()
+	approved := pending
+	approved.StateHash = HashSecret(state)
+	approved.Approved = true
+	approved.ExpiresAt = now.Add(p.cfg.PendingAuthTTL)
+	if err := p.store.SavePendingAuth(r.Context(), approved); err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist authorization request")
+		return
+	}
+
+	google := p.cfg.GoogleAuthURL + "?" + url.Values{
+		"client_id":     {p.cfg.GoogleClientID},
+		"redirect_uri":  {p.cfg.GoogleRedirectURL},
+		"response_type": {"code"},
+		"scope":         {GrantedScope},
+		"state":         {state},
+		"access_type":   {"offline"},
+		"prompt":        {"select_account"},
+	}.Encode()
+
+	w.Header().Set("Cache-Control", "no-store")
+	http.Redirect(w, r, google, http.StatusFound)
 }
 
 // --- google callback -----------------------------------------------------
@@ -287,6 +457,10 @@ const unlinkedAccountHTML = `<!doctype html>
 // back to the MCP client.
 func (p *Provider) GoogleCallback() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeOAuthError(w, http.StatusMethodNotAllowed, "invalid_request", "GET required")
+			return
+		}
 		q := r.URL.Query()
 
 		state := q.Get("state")
@@ -299,8 +473,27 @@ func (p *Provider) GoogleCallback() http.HandlerFunc {
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load authorization request")
 			return
 		}
+		// From here the pending record is consumed whatever happens: every
+		// failure below burns it, so nothing can be retried by an attacker.
 		if !ok {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unknown, expired or already used state")
+			return
+		}
+		p.clearBinderCookie(w)
+		if !pending.Approved {
+			// A record that never passed the consent step (its handle is the
+			// consent nonce, not a Google state).
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+				"this authorization request was never approved")
+			return
+		}
+		if !p.binderMatches(r, pending.BinderHash) {
+			// The browser completing the Google login is not the one that
+			// started the flow. This is the cross-browser authorization
+			// hijack; fail closed and never emit a code.
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+				"this login was completed in a different browser than the one that "+
+					"started the authorization request; start the connection again")
 			return
 		}
 		if !p.now().Before(pending.ExpiresAt) {
@@ -475,7 +668,13 @@ func (p *Provider) authorizationCodeGrant(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	p.issueTokenPair(r.Context(), w, ac.ClientID, ac.UserID)
+	// A fresh login starts a new refresh-token family.
+	familyID, err := randomToken(16)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not start a token family")
+		return
+	}
+	p.issueTokenPair(r.Context(), w, ac.ClientID, ac.UserID, familyID, p.now())
 }
 
 func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
@@ -485,19 +684,50 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "refresh_token and client_id are required")
 		return
 	}
+	now := p.now()
+	tokenHash := HashSecret(raw)
 
 	// Rotation: consuming invalidates the presented token unconditionally.
-	rt, ok, err := p.store.ConsumeRefreshToken(r.Context(), HashSecret(raw))
+	rt, ok, err := p.store.ConsumeRefreshToken(r.Context(), tokenHash)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load refresh token")
 		return
 	}
 	if !ok {
+		// A miss on a token we rotated away recently is refresh-token REUSE:
+		// either the legitimate client or a thief is replaying a token that is
+		// already spent, and we cannot tell which. Kill the whole family so
+		// the other holder's chain dies too.
+		if familyID, reused := p.familyOfConsumedRefresh(tokenHash, now); reused {
+			if err := p.store.RevokeRefreshTokenFamily(r.Context(), familyID); err != nil {
+				writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not revoke the token family")
+				return
+			}
+		}
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or already used")
 		return
 	}
-	if !p.now().Before(rt.ExpiresAt) {
+	p.rememberConsumedRefresh(tokenHash, rt.FamilyID, now)
+
+	if !now.Before(rt.ExpiresAt) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
+		return
+	}
+	// Absolute lifetime: rotation must not be able to extend a session
+	// forever. Measured from the login that created the family.
+	familyStart := rt.FamilyCreatedAt
+	if familyStart.IsZero() {
+		familyStart = rt.CreatedAt
+	}
+	if familyStart.IsZero() || !now.Before(familyStart.Add(p.cfg.RefreshTokenAbsoluteTTL)) {
+		if rt.FamilyID != "" {
+			if err := p.store.RevokeRefreshTokenFamily(r.Context(), rt.FamilyID); err != nil {
+				writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not revoke the token family")
+				return
+			}
+		}
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant",
+			"refresh token family has reached its absolute lifetime; sign in again")
 		return
 	}
 	if rt.ClientID != clientID {
@@ -505,10 +735,10 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.issueTokenPair(r.Context(), w, rt.ClientID, rt.UserID)
+	p.issueTokenPair(r.Context(), w, rt.ClientID, rt.UserID, rt.FamilyID, familyStart)
 }
 
-func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, clientID, userID string) {
+func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, clientID, userID, familyID string, familyCreatedAt time.Time) {
 	now := p.now()
 
 	access, err := p.issueAccessToken(userID, now)
@@ -521,12 +751,19 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, cl
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue refresh token")
 		return
 	}
+	// The sliding window never outlives the absolute cap.
+	expiresAt := now.Add(p.cfg.RefreshTokenTTL)
+	if absolute := familyCreatedAt.Add(p.cfg.RefreshTokenAbsoluteTTL); absolute.Before(expiresAt) {
+		expiresAt = absolute
+	}
 	if err := p.store.SaveRefreshToken(ctx, RefreshToken{
-		TokenHash: HashSecret(refresh),
-		ClientID:  clientID,
-		UserID:    userID,
-		ExpiresAt: now.Add(p.cfg.RefreshTokenTTL),
-		CreatedAt: now,
+		TokenHash:       HashSecret(refresh),
+		ClientID:        clientID,
+		UserID:          userID,
+		FamilyID:        familyID,
+		FamilyCreatedAt: familyCreatedAt,
+		ExpiresAt:       expiresAt,
+		CreatedAt:       now,
 	}); err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist refresh token")
 		return
