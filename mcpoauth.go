@@ -92,19 +92,33 @@ func New(cfg Config, store Store) (*Provider, error) {
 		}
 	}
 
-	// InsecureDevMode weakens the browser-binding cookie. It is only ever
-	// coherent for plain-http local development, so refuse it for anything
-	// that looks remotely like a deployment.
-	if cfg.InsecureDevMode {
-		if err := requireLoopbackHTTP("Issuer", cfg.Issuer); err != nil {
-			return nil, err
-		}
-	}
-
 	if cfg.MetadataBaseURL == "" {
 		cfg.MetadataBaseURL = cfg.Issuer
 	} else if err := requireAbsoluteURL("MetadataBaseURL", cfg.MetadataBaseURL); err != nil {
 		return nil, err
+	}
+
+	// InsecureDevMode weakens the browser-binding cookie. It is only ever
+	// coherent for plain-http local development, so refuse it for anything
+	// that looks remotely like a deployment. Gating Issuer alone was not
+	// enough: a loopback Issuer with every OTHER URL pointing at a public
+	// https deployment was accepted, and the real origin then lost __Host- and
+	// Secure on its binder cookie.
+	if cfg.InsecureDevMode {
+		devURLs := []struct{ name, value string }{
+			{"Issuer", cfg.Issuer},
+			{"ResourceURL", cfg.ResourceURL},
+			{"MetadataBaseURL", cfg.MetadataBaseURL},
+			{"AuthorizeURL", cfg.AuthorizeURL},
+			{"TokenURL", cfg.TokenURL},
+			{"RegisterURL", cfg.RegisterURL},
+			{"GoogleRedirectURL", cfg.GoogleRedirectURL},
+		}
+		for _, u := range devURLs {
+			if err := requireLoopbackHTTP(u.name, u.value); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	if cfg.AccessTokenTTL <= 0 {
@@ -136,6 +150,9 @@ func New(cfg Config, store Store) (*Provider, error) {
 	}
 	if cfg.PurgeInterval <= 0 {
 		cfg.PurgeInterval = 5 * time.Minute
+	}
+	if strings.TrimSpace(cfg.VerifyStoreUserID) == "" {
+		cfg.VerifyStoreUserID = defaultVerifyStoreUserID
 	}
 	if len(cfg.AllowedRedirectHosts) > 0 {
 		hosts := make([]string, 0, len(cfg.AllowedRedirectHosts))
@@ -228,6 +245,30 @@ func (p *Provider) maybePurge(ctx context.Context) {
 // binders for. Older values fall off the end of the cookie.
 const maxBinders = 5
 
+// maxBinderLen caps a single binder value. Real ones are 43 characters (32
+// random bytes, base64url). The cap plus the alphabet check below is what stops
+// an attacker-supplied 200 KB cookie value from being echoed back verbatim in
+// the Set-Cookie header that dropBinder writes.
+const maxBinderLen = 64
+
+// validBinder reports whether v has the shape this package issues: a non-empty
+// base64url token no longer than maxBinderLen. Anything else is junk a browser
+// never received from us, and is dropped on read.
+func validBinder(v string) bool {
+	if v == "" || len(v) > maxBinderLen {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '-', c == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // binderCookieName is __Host-prefixed unless the provider is in dev mode.
 func (p *Provider) binderCookieName() string {
 	if p.cfg.InsecureDevMode {
@@ -243,11 +284,11 @@ func (p *Provider) readBinders(r *http.Request) []string {
 		return nil
 	}
 	// SplitN, not Split: an oversized cookie must not be exploded into a huge
-	// slice. Anything past the cap lands in the final element, which simply
-	// never matches a binder hash.
+	// slice. Anything past the cap lands in the final element, which still
+	// carries a separator and so is rejected by validBinder.
 	out := make([]string, 0, maxBinders)
 	for _, v := range strings.SplitN(c.Value, BinderCookieSep, maxBinders+1) {
-		if v == "" {
+		if !validBinder(v) {
 			continue
 		}
 		out = append(out, v)
