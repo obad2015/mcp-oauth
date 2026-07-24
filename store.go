@@ -1,6 +1,9 @@
 package mcpoauth
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Store is the persistence contract an application implements to back the
 // authorization server. It is deliberately driver-agnostic: any SQL, KV or
@@ -40,6 +43,18 @@ type Store interface {
 	ConsumeRefreshToken(ctx context.Context, tokenHash string) (RefreshToken, bool, error)
 	// RevokeRefreshTokensForUser invalidates every refresh token of a user.
 	RevokeRefreshTokensForUser(ctx context.Context, userID string) error
+	// RevokeRefreshTokenFamily invalidates every refresh token in one
+	// rotation chain. The Provider calls it when it sees a refresh token
+	// replayed after it was already rotated away, which is the canonical
+	// signal that a token leaked.
+	RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
+
+	// PurgeExpired deletes every authorization code, pending authorization
+	// request and refresh token whose ExpiresAt is before the given instant.
+	// It must be safe to call concurrently with everything else. The
+	// Provider calls it opportunistically; applications should also run it
+	// from a ticker.
+	PurgeExpired(ctx context.Context, before time.Time) error
 
 	// FindUserIDByEmail maps a verified Google email to an EXISTING
 	// application user. Return ok=false when there is no such user — the

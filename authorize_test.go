@@ -150,14 +150,19 @@ func TestAuthorize(t *testing.T) {
 		}
 	})
 
-	t.Run("POST is rejected", func(t *testing.T) {
+	// POST is the consent-approval leg, so it is no longer a 405 — but the
+	// authorization parameters alone must not get anyone past it.
+	t.Run("POST without a consent nonce is rejected", func(t *testing.T) {
 		h := newHarness(t)
 		clientID := h.register(testRedirectURI)
 		req := postForm("/authorize", baseParams(clientID))
 		rec := newRec()
 		h.p.Authorize()(rec, req)
-		if rec.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("status = %d, want 405", rec.Code)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body %s)", rec.Code, rec.Body.String())
+		}
+		if loc := rec.Header().Get("Location"); loc != "" {
+			t.Fatalf("an unapproved POST redirected to %q", loc)
 		}
 	})
 }
