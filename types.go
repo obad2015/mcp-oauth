@@ -217,8 +217,22 @@ type Config struct {
 	// InsecureDevMode drops the __Host- prefix and the Secure attribute from
 	// the browser-binding cookie so the flow works over plain http on
 	// localhost. NEVER set it in production — New enforces that by rejecting
-	// it unless Issuer is an http:// URL on a loopback host.
+	// it unless EVERY configured URL (Issuer, ResourceURL, MetadataBaseURL,
+	// AuthorizeURL, TokenURL, RegisterURL and GoogleRedirectURL) is http:// on
+	// a loopback host.
 	InsecureDevMode bool
+
+	// VerifyStoreUserID is the user ID Provider.VerifyStore writes on its
+	// canary auth-code and refresh-token records. Default
+	// "mcpoauth-verify-user".
+	//
+	// Set it when your schema constrains the user_id column — a `user_id UUID`
+	// column, or a CHECK constraint — otherwise VerifyStore fails at startup
+	// with a driver type error instead of a contract error. Any syntactically
+	// valid value of the right type works; it must NOT be a real user, and
+	// there must be no foreign key from these tables to your users table (see
+	// the README).
+	VerifyStoreUserID string
 
 	// HTTPClient is used for the Google token exchange and JWKS fetches.
 	// Defaults to a client with a 10s timeout.

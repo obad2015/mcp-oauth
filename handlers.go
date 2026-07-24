@@ -730,6 +730,23 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 	now := p.now()
 	tokenHash := HashSecret(raw)
 
+	// Bind the token to the presenting client BEFORE consuming it. Consuming
+	// first would let anyone who merely learns a refresh token burn it by
+	// presenting it with an arbitrary client_id: the owner's next legitimate
+	// use would then be classified as reuse and kill the whole family — an
+	// unauthenticated logout of the victim, and a self-inflicted one on a
+	// client_id typo. A client mismatch is therefore non-consuming and never
+	// revokes anything.
+	bound, known, err := p.store.GetRefreshToken(r.Context(), tokenHash)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load refresh token")
+		return
+	}
+	if known && bound.ClientID != clientID {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token was issued to another client")
+		return
+	}
+
 	rt, ok, err := p.store.ConsumeRefreshToken(r.Context(), tokenHash, now)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load refresh token")
@@ -829,7 +846,13 @@ func (p *Provider) graceApplies(ctx context.Context, rt RefreshToken, raw, clien
 	if p.cfg.RefreshGracePeriod <= 0 || rt.ConsumedAt.IsZero() {
 		return false
 	}
-	if now.Before(rt.ConsumedAt) || now.After(rt.ConsumedAt.Add(p.cfg.RefreshGracePeriod)) {
+	// Only lateness disqualifies a replay. There is deliberately NO lower bound:
+	// a `now` that precedes the stored stamp is the signature of a genuinely
+	// concurrent duplicate — this request sampled its clock before the winning
+	// rotation stamped the row — and on a multi-node deployment it is also
+	// ordinary clock skew. Rejecting it revoked the family for the exact case
+	// this window exists to absorb.
+	if now.After(rt.ConsumedAt.Add(p.cfg.RefreshGracePeriod)) {
 		return false
 	}
 	if rt.ClientID != clientID {
@@ -871,21 +894,10 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, pr
 		expiresAt = familyExpiresAt
 	}
 
-	// Link the predecessor first: once the new token exists, a duplicate
-	// submission must be able to find the successor rather than be told the
-	// rotation is still in flight.
-	if prev.hash != "" {
-		sealed, err := p.sealSuccessor(prev.raw, refresh)
-		if err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not seal the rotated token")
-			return
-		}
-		if err := p.store.LinkRefreshSuccessor(ctx, prev.hash, familyID, sealed); err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not record the token rotation")
-			return
-		}
-	}
-
+	// Persist the successor BEFORE linking it onto the predecessor. The reverse
+	// order left a sealed blob pointing at a row that did not exist yet, so a
+	// failed or slow SaveRefreshToken turned the client's next legitimate retry
+	// into a family revocation.
 	if err := p.store.SaveRefreshToken(ctx, RefreshToken{
 		TokenHash:       HashSecret(refresh),
 		ClientID:        clientID,
@@ -898,6 +910,30 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, pr
 	}); err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist refresh token")
 		return
+	}
+
+	if prev.hash != "" {
+		sealed, err := p.sealSuccessor(prev.raw, refresh)
+		if err != nil {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not seal the rotated token")
+			return
+		}
+		if err := p.store.LinkRefreshSuccessor(ctx, prev.hash, familyID, sealed); err != nil {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not record the token rotation")
+			return
+		}
+		// Re-check the family AFTER the write. A reuse detection that fired
+		// while this rotation was in flight would have deleted the family
+		// between our read and our SaveRefreshToken, and the row we just
+		// inserted would silently resurrect it — the victim stays evicted while
+		// the attacker keeps rotating. The predecessor row disappearing is that
+		// signal: undo our own insert by revoking the family we issued into.
+		if _, still, err := p.store.GetRefreshToken(ctx, prev.hash); err != nil || !still {
+			_ = p.store.RevokeRefreshTokenFamily(ctx, familyID)
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant",
+				"refresh token was already used; the whole token family has been revoked, sign in again")
+			return
+		}
 	}
 
 	p.writeTokenPair(w, userID, refresh, now)

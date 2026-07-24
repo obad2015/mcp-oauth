@@ -15,8 +15,16 @@ import (
 //     concurrent second call for the same value must return ok=false. In SQL
 //     this is typically a "DELETE ... RETURNING *" in one statement.
 //   - ConsumeRefreshToken is different: it MUST NOT delete. See its own doc.
-//   - Consume* returning an expired record is fine; the Provider checks
-//     expiry itself. Returning ok=false for expired records is also fine.
+//   - ConsumeAuthCode and ConsumePendingAuth may return expired records (the
+//     Provider checks expiry itself) or filter them out — either is fine.
+//     ConsumeRefreshToken MUST NOT filter: an expired CONSUMED refresh-token
+//     row is the reuse-detection ledger, so `AND expires_at > now()` there
+//     turns a replayed stolen token into a plain invalid_grant and the family
+//     is never revoked. Return the row and let the Provider judge it.
+//   - No foreign keys between these tables, and none from them to your users
+//     table. Rows are removed independently (a client registration expires
+//     long before the refresh tokens it issued), and Provider.VerifyStore
+//     writes canary rows for a user that does not exist.
 //   - Nothing here ever receives a raw secret: codes, refresh tokens, the
 //     pending state and the browser binder are always identified by their
 //     SHA-256 hash (hex).
@@ -45,9 +53,12 @@ type Store interface {
 	ConsumeAuthCode(ctx context.Context, codeHash string) (AuthCode, bool, error)
 
 	// SavePendingAuth persists the state of an in-flight authorize request.
-	// It is called twice per flow with two different StateHash values (the
-	// consent nonce, then the Google state), so it is an insert, not an
-	// update.
+	//
+	// It is called TWICE per flow, with the same ClientID and two DIFFERENT
+	// StateHash values (the consent nonce, then the Google state). It is
+	// therefore a plain INSERT keyed on state_hash. An UPDATE, or an upsert
+	// keyed on client_id, silently drops the first record and every login then
+	// dies at the consent step.
 	SavePendingAuth(ctx context.Context, p PendingAuth) error
 	// ConsumePendingAuth atomically fetches and invalidates pending state.
 	ConsumePendingAuth(ctx context.Context, stateHash string) (PendingAuth, bool, error)
@@ -79,21 +90,33 @@ type Store interface {
 	//
 	//   - Atomic: of N concurrent calls for the same hash, exactly one may see
 	//     a zero ConsumedAt.
-	//   - Idempotent stamp: an already-consumed row keeps its original
-	//     ConsumedAt (do not overwrite it), and the returned ConsumedAt is the
-	//     value that was stored before this call.
+	//   - Idempotent stamp: an already-consumed row keeps its ORIGINAL
+	//     ConsumedAt forever (never overwrite it), and the returned ConsumedAt
+	//     is the value that was stored before this call.
+	//   - No filtering: return the row whatever its ExpiresAt says.
 	//   - consumedAt is the Provider's clock; store exactly that value.
 	//
-	// PostgreSQL, one statement:
+	// PostgreSQL, one statement, at READ COMMITTED (the default):
 	//
 	//	WITH before AS (
-	//	    SELECT * FROM mcpoauth_refresh_tokens
+	//	    SELECT * FROM mcp_oauth_refresh_tokens
 	//	    WHERE token_hash = $1 FOR UPDATE
 	//	), stamped AS (
-	//	    UPDATE mcpoauth_refresh_tokens SET consumed_at = $2
+	//	    UPDATE mcp_oauth_refresh_tokens SET consumed_at = $2
 	//	    WHERE token_hash = $1 AND consumed_at IS NULL
 	//	)
 	//	SELECT * FROM before;
+	//
+	// `AND consumed_at IS NULL` is LOAD-BEARING — see the README. Without it
+	// the row is re-stamped on every replay while still returning its previous
+	// value, which passes any casual test and turns Config.RefreshGracePeriod
+	// into a rolling, unbounded window: a stolen token is replayable forever
+	// and reuse detection never fires. Provider.VerifyStore consumes its canary
+	// three times specifically to catch this.
+	//
+	// Do NOT write it as `UPDATE ... WHERE consumed_at IS NULL RETURNING *`:
+	// that returns ZERO rows on a replay, which the Provider reads as "unknown
+	// token" — plain invalid_grant, no family revocation, silently.
 	ConsumeRefreshToken(ctx context.Context, tokenHash string, consumedAt time.Time) (RefreshToken, bool, error)
 
 	// LinkRefreshSuccessor records, on an already-consumed row, the sealed
@@ -109,7 +132,9 @@ type Store interface {
 	// own family; for a legacy row whose FamilyID was empty this adopts the row
 	// into the new family, so a later replay can still revoke it.
 	//
-	// It MUST be a no-op returning nil when the hash is unknown.
+	// It MUST be a no-op returning nil when the hash is unknown, and it must
+	// NEVER be an UPSERT: an INSERT path here materialises a refresh-token row
+	// that was never issued, with a caller-influenced family_id.
 	LinkRefreshSuccessor(ctx context.Context, tokenHash, familyID string, sealed []byte) error
 
 	// RevokeRefreshTokensForUser invalidates every refresh token of a user.
