@@ -373,7 +373,7 @@ CREATE INDEX ON mcp_oauth_refresh_tokens (family_id);
 CREATE INDEX ON mcp_oauth_refresh_tokens (expires_at, family_expires_at);
 ```
 
-### Eight rules
+### Nine rules
 
 1. **`ConsumeAuthCode` and `ConsumePendingAuth` must be atomic and single-use.** A concurrent second call for the same hash must return `ok=false`. In PostgreSQL that is one statement:
 
@@ -400,7 +400,7 @@ CREATE INDEX ON mcp_oauth_refresh_tokens (expires_at, family_expires_at);
    | `ok=true`, `ConsumedAt` zero | first use → a legitimate rotation |
    | `ok=true`, `ConsumedAt` set | replay → duplicate submission (inside `RefreshGracePeriod`) or **reuse**, which revokes the family |
 
-   The correct idiom, one statement, at **`READ COMMITTED`** (PostgreSQL's default — see rule 4):
+   The correct idiom, one statement, at **`READ COMMITTED`** (PostgreSQL's default — see rule 5):
 
    ```sql
    WITH before AS (
@@ -429,9 +429,17 @@ CREATE INDEX ON mcp_oauth_refresh_tokens (expires_at, family_expires_at);
 
    **Do not filter on `expires_at` either.** An *expired* `consumed_at`-stamped row is precisely the ledger entry that catches a token stolen weeks ago; `AND expires_at > now()` turns that replay into an ordinary `invalid_grant` with no revocation. The provider checks expiry itself. (The same licence *is* safe for `ConsumeAuthCode` and `ConsumePendingAuth` — those records are deleted on use and carry no history.)
 
-4. **Isolation level: `READ COMMITTED`.** That is PostgreSQL's default and what the idiom above is written for. Under `REPEATABLE READ` or `SERIALIZABLE` the statement still yields exactly one winner, but concurrent callers get `SQLSTATE 40001` (`could not serialize access due to concurrent update`) and **you must catch it and retry** — an unhandled 40001 surfaces as a 500 on a perfectly ordinary parallel refresh. If your application runs everything inside a `REPEATABLE READ` transaction, either run these statements on their own connection or add the retry.
+4. **`GetRefreshToken` must never be filtered, on anything — not `consumed_at`, not `expires_at`, not `family_expires_at`:**
 
-5. **`LinkRefreshSuccessor` attaches the sealed successor and re-stamps the family**, on the row that was just consumed. `sealed` is an opaque encrypted blob — persist the bytes, return them unchanged, never interpret them. Only a caller presenting the raw predecessor token can decrypt it, so a dump of this table reveals no tokens.
+   ```sql
+   SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = $1;  -- never filtered, on anything (not consumed_at, not expiry)
+   ```
+
+   The provider calls this on an already-consumed row in two places: the `client_id` pre-check before a rotation, and the post-`LinkRefreshSuccessor` re-read that confirms the row it just wrote onto still exists. It is tempting to add `AND consumed_at IS NULL` by symmetry with `ConsumeRefreshToken` — do not. That breaks both callers: the pre-check treats every refresh as an unknown token, and the post-link re-read never finds the just-consumed predecessor, so every single rotation revokes its own family.
+
+5. **Isolation level: `READ COMMITTED`.** That is PostgreSQL's default and what the idiom above is written for. Under `REPEATABLE READ` or `SERIALIZABLE` the statement still yields exactly one winner, but concurrent callers get `SQLSTATE 40001` (`could not serialize access due to concurrent update`) and **you must catch it and retry** — an unhandled 40001 surfaces as a 500 on a perfectly ordinary parallel refresh. If your application runs everything inside a `REPEATABLE READ` transaction, either run these statements on their own connection or add the retry.
+
+6. **`LinkRefreshSuccessor` attaches the sealed successor and re-stamps the family**, on the row that was just consumed. `sealed` is an opaque encrypted blob — persist the bytes, return them unchanged, never interpret them. Only a caller presenting the raw predecessor token can decrypt it, so a dump of this table reveals no tokens.
 
    ```sql
    UPDATE mcp_oauth_refresh_tokens
@@ -441,11 +449,11 @@ CREATE INDEX ON mcp_oauth_refresh_tokens (expires_at, family_expires_at);
 
    **Never make this an UPSERT.** An `INSERT ... ON CONFLICT` path mints a refresh-token row for a token that was never issued, carrying a caller-influenced `family_id`. An unknown hash must be a silent no-op returning `nil`.
 
-6. **`RevokeRefreshTokenFamily` must delete every token sharing the `family_id`**, consumed rows included — one `DELETE FROM mcp_oauth_refresh_tokens WHERE family_id = $1`. It is called when a rotated-away token is replayed, which is the canonical signal that a refresh token leaked; a no-op implementation silently disables the defence.
+7. **`RevokeRefreshTokenFamily` must delete every token sharing the `family_id`**, consumed rows included — one `DELETE FROM mcp_oauth_refresh_tokens WHERE family_id = $1`. It is called when a rotated-away token is replayed, which is the canonical signal that a refresh token leaked; a no-op implementation silently disables the defence.
 
-7. **`FindUserIDByEmail` must not create users.** Returning `ok=false` is how you refuse a stranger.
+8. **`FindUserIDByEmail` must not create users.** Returning `ok=false` is how you refuse a stranger.
 
-8. **`PurgeExpired` must be safe to call concurrently with everything else**, and it covers all four tables. Note the refresh-token condition: a consumed row is retained until its **family** dies, which is much later than its own `expires_at`.
+9. **`PurgeExpired` must be safe to call concurrently with everything else**, and it covers all four tables. Note the refresh-token condition: a consumed row is retained until its **family** dies, which is much later than its own `expires_at`.
 
    ```sql
    DELETE FROM mcp_oauth_auth_codes     WHERE expires_at < $1;
@@ -458,7 +466,7 @@ CREATE INDEX ON mcp_oauth_refresh_tokens (expires_at, family_expires_at);
 
 ### What `VerifyStore` actually catches
 
-It round-trips a canary through every method and reports, in one error, each rule that was broken. It detects all of: a dropped `BinderHash`, `Approved`, `FamilyID`, `FamilyCreatedAt`, `FamilyExpiresAt`, `ConsumedAt` or `SuccessorSealed`; a `ConsumeRefreshToken` that deletes, that never stamps, that returns the row *after* stamping, that **overwrites** the stamp (rule 3), or that filters expired rows; a `LinkRefreshSuccessor` written as an upsert; a `SavePendingAuth` that loses one of the two records (rule 2); a replayable authorization code; a no-op `RevokeRefreshTokenFamily`; and a `PurgeExpired` that forgets a table.
+It round-trips a canary through every method and reports, in one error, each rule that was broken. It detects all of: a dropped `BinderHash`, `Approved`, `FamilyID`, `FamilyCreatedAt`, `FamilyExpiresAt`, `ConsumedAt` or `SuccessorSealed`; a `ConsumeRefreshToken` that deletes, that never stamps, that returns the row *after* stamping, that **overwrites** the stamp (rule 3), that filters expired rows, or that is not atomic under concurrent callers (fires 8 concurrent calls at one canary and requires exactly one zero `ConsumedAt`); a `LinkRefreshSuccessor` written as an upsert; a `SavePendingAuth` that loses one of the two records (rule 2); a replayable authorization code; a no-op `RevokeRefreshTokenFamily`; and a `PurgeExpired` that deletes a refresh-token row before its `family_expires_at` has passed, or that skips the **refresh-token or client** table entirely. It does *not* exercise `PurgeExpired` against the auth-code or pending-auth tables — those canaries are already consumed by the time cleanup runs, so a purge that forgets either of those two tables still passes.
 
 ```go
 provider, err := mcpoauth.New(cfg, store)

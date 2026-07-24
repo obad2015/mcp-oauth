@@ -69,6 +69,19 @@ type Store interface {
 
 	// GetRefreshToken reads a refresh-token row without modifying it.
 	// ok=false when the hash is unknown.
+	//
+	// It MUST NOT be filtered on anything — not ConsumedAt, not ExpiresAt, not
+	// FamilyExpiresAt:
+	//
+	//	SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = $1;
+	//
+	// The Provider calls this on an already-consumed row in two places: the
+	// client_id pre-check before a rotation, and the post-Link re-read that
+	// confirms the row it just wrote onto still exists. Add `AND consumed_at IS
+	// NULL` by symmetry with ConsumeRefreshToken and both break: the pre-check
+	// treats every refresh as an unknown token, and the post-Link re-read never
+	// finds the just-consumed predecessor, so every rotation revokes its own
+	// family.
 	GetRefreshToken(ctx context.Context, tokenHash string) (RefreshToken, bool, error)
 
 	// ConsumeRefreshToken atomically stamps ConsumedAt on a refresh-token row
