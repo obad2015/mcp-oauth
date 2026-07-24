@@ -21,6 +21,20 @@ import (
 	"github.com/obad2015/mcp-oauth/memstore"
 )
 
+// devLoopback is the only shape of config InsecureDevMode is allowed with:
+// plain http on a loopback host.
+func devLoopback(c *mcpoauth.Config) {
+	const base = "http://127.0.0.1:8080"
+	c.InsecureDevMode = true
+	c.Issuer = base
+	c.ResourceURL = base + "/api/mcp"
+	c.MetadataBaseURL = base + "/api"
+	c.GoogleRedirectURL = base + "/api/mcp/oauth/google/callback"
+	c.AuthorizeURL = base + "/api/mcp/oauth/authorize"
+	c.TokenURL = base + "/api/mcp/oauth/token"
+	c.RegisterURL = base + "/api/mcp/oauth/register"
+}
+
 const (
 	testIssuer      = "https://app.example.com"
 	testResourceURL = "https://app.example.com/api/mcp"
@@ -167,12 +181,23 @@ func (g *fakeGoogle) handleCerts(w http.ResponseWriter, _ *http.Request) {
 type harness struct {
 	t      *testing.T
 	p      *mcpoauth.Provider
+	cfg    mcpoauth.Config
 	store  *memstore.MemoryStore
 	google *fakeGoogle
 
 	// binder is the browser-binding cookie handed out by the last authorize
 	// GET, replayed by callback() the way a real browser would.
 	binder *http.Cookie
+
+	// clock backs advance(); it starts at the real time.
+	clock time.Time
+}
+
+// advance moves the provider's clock forward and leaves it there.
+func (h *harness) advance(d time.Duration) {
+	h.clock = h.clock.Add(d)
+	at := h.clock
+	h.p.SetNowForTest(func() time.Time { return at })
 }
 
 // signingKey is the key access tokens are actually signed with: the configured
@@ -208,7 +233,21 @@ func newHarness(t *testing.T, tweak ...func(*mcpoauth.Config)) *harness {
 	if err != nil {
 		t.Fatalf("mcpoauth.New() error: %v", err)
 	}
-	return &harness{t: t, p: p, store: store, google: g}
+	return &harness{t: t, p: p, cfg: cfg, store: store, google: g, clock: time.Now()}
+}
+
+// restart replaces the Provider with a brand new one over the SAME store, the
+// way a redeploy or `systemctl restart` would. Anything the old provider was
+// holding in process memory is gone.
+func (h *harness) restart() {
+	h.t.Helper()
+	p, err := mcpoauth.New(h.cfg, h.store)
+	if err != nil {
+		h.t.Fatalf("restarting provider: %v", err)
+	}
+	at := h.clock
+	p.SetNowForTest(func() time.Time { return at })
+	h.p = p
 }
 
 // register runs dynamic client registration and returns the client_id.
@@ -239,10 +278,18 @@ func (h *harness) registerNamed(name string, redirectURIs ...string) string {
 }
 
 // authorizeGET performs only the first leg: the interstitial consent page.
+//
+// It behaves like a browser cookie jar: whatever binder cookie the harness
+// currently holds is sent along, and whatever comes back replaces it. That
+// matters because one cookie carries the binders of several concurrent flows.
 func (h *harness) authorizeGET(params url.Values) *httptest.ResponseRecorder {
 	h.t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil)
+	if h.binder != nil {
+		req.AddCookie(h.binder)
+	}
 	rec := httptest.NewRecorder()
-	h.p.Authorize()(rec, httptest.NewRequest(http.MethodGet, "/authorize?"+params.Encode(), nil))
+	h.p.Authorize()(rec, req)
 	if c := binderCookie(rec); c != nil {
 		h.binder = c
 	}

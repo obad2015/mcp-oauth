@@ -92,7 +92,7 @@ func TestConsentStep(t *testing.T) {
 	})
 
 	t.Run("dev mode falls back to the unprefixed cookie name", func(t *testing.T) {
-		h := newHarness(t, func(c *mcpoauth.Config) { c.InsecureDevMode = true })
+		h := newHarness(t, devLoopback)
 		clientID := h.register(testRedirectURI)
 		c := binderCookie(h.authorizeGET(authorizeParams(clientID, testRedirectURI)))
 		if c == nil {

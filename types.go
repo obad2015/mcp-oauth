@@ -23,6 +23,9 @@
 //   - Authorization codes, the consent nonce, pending state and refresh tokens
 //     are single-use. Replaying a rotated refresh token revokes its whole
 //     family, and a family cannot outlive Config.RefreshTokenAbsoluteTTL.
+//     Reuse detection lives in the Store — a consumed refresh-token row is
+//     retained until its family expires — so it survives a process restart and
+//     cannot be evicted by rotating a stolen token in a loop.
 //   - PKCE S256 is mandatory; "plain" is rejected and the challenge must
 //     satisfy RFC 7636.
 //   - Redirect URIs are matched exactly against the registered set; a request
@@ -70,9 +73,16 @@ const ConsentNonceField = "mcpoauth_consent"
 // Binder cookie names. The __Host- prefix pins the cookie to the exact origin
 // and requires Secure + Path=/ + no Domain; the bare name is only used when
 // Config.InsecureDevMode is set (plain-http local development).
+//
+// One cookie carries up to maxBinders values separated by BinderCookieSep, so
+// several authorization flows can be in progress in the same browser (two tabs,
+// or a retry) without the newest one invalidating the others.
 const (
 	BinderCookieName         = "__Host-mcpoauth_binder"
 	BinderCookieNameInsecure = "mcpoauth_binder"
+	// BinderCookieSep separates the individual binder values inside the
+	// cookie. It is not part of the base64url alphabet the values use.
+	BinderCookieSep = "."
 )
 
 // ConsentRequest is everything a custom consent page needs in order to render
@@ -129,7 +139,13 @@ type Config struct {
 	RegisterURL  string
 
 	// JWTSecret is the input keying material for the access-token signing
-	// key. It must be at least 32 bytes; New rejects anything shorter.
+	// key and for the refresh-successor sealing key.
+	//
+	// It must be at least 32 bytes AND contain at least 8 distinct byte
+	// values; New rejects anything else. Those are crude sanity checks, not a
+	// real entropy measurement: 32 bytes of `openssl rand -base64 32` output
+	// pass, "aaaa..." does not, but a low-entropy passphrase that happens to
+	// use enough different characters still would. Generate it randomly.
 	//
 	// It is NOT used to sign directly: the HS256 key is derived from it with
 	// HKDF-Expand(SHA-256, JWTSecret, "mcpoauth/v1/access-token"). An
@@ -148,10 +164,36 @@ type Config struct {
 	// it is rotated. Default 90d.
 	RefreshTokenAbsoluteTTL time.Duration
 
-	// RefreshReuseWindow is how long a consumed refresh-token hash is
-	// remembered so that a later replay can be attributed to its family and
-	// trigger a family-wide revocation. Default 24h.
-	RefreshReuseWindow time.Duration
+	// RefreshGracePeriod makes a rotation idempotent for a short moment: if
+	// the token that was JUST rotated away is presented again within this
+	// window, the Provider replies with the very same refresh token the
+	// rotation issued (plus a freshly minted access token) instead of treating
+	// it as reuse. Default 30s; set a negative value to disable it.
+	//
+	// It exists because a client that never received the rotation response
+	// (dropped connection, a retry, two parallel requests) would otherwise
+	// destroy its own session: its retry looks exactly like a replay and
+	// revokes the family.
+	//
+	// The trade-off is explicit: for this window a leaked refresh token that is
+	// replayed does NOT trigger family revocation, it simply hands the replayer
+	// the same successor. The window only ever applies to the single
+	// most-recently-consumed token of a family, only while its successor is
+	// still unused, and only to the same client. Anything older, anything after
+	// the window, or a family whose successor has already moved on is reuse and
+	// revokes the family.
+	RefreshGracePeriod time.Duration
+
+	// UnusedClientTTL is how long a dynamically registered client that never
+	// completed a login is kept before PurgeExpired may delete it. Default 24h.
+	// Registration is unauthenticated, so this is what stops the client table
+	// from growing forever — put a rate limit in front of the endpoint too.
+	UnusedClientTTL time.Duration
+
+	// ClientTTL is how long a client that DID complete a login is kept, from
+	// the most recent completed login. Default 90d. An expired registration is
+	// not a lockout: MCP clients re-register automatically.
+	ClientTTL time.Duration
 
 	// PurgeInterval throttles the opportunistic call to PurgeExpired the
 	// provider makes while serving requests. Default 5m. It is a backstop
@@ -174,7 +216,8 @@ type Config struct {
 
 	// InsecureDevMode drops the __Host- prefix and the Secure attribute from
 	// the browser-binding cookie so the flow works over plain http on
-	// localhost. NEVER set it in production.
+	// localhost. NEVER set it in production — New enforces that by rejecting
+	// it unless Issuer is an http:// URL on a loopback host.
 	InsecureDevMode bool
 
 	// HTTPClient is used for the Google token exchange and JWKS fetches.
@@ -188,11 +231,19 @@ type Config struct {
 }
 
 // Client is a dynamically registered public OAuth client.
+//
+// Registration is unauthenticated (that is what RFC 7591 dynamic registration
+// means for MCP CLI clients), so registrations are not permanent: ExpiresAt
+// starts at Config.UnusedClientTTL and is pushed out to Config.ClientTTL each
+// time a login completes with this client.
 type Client struct {
 	ClientID     string
 	RedirectURIs []string
 	ClientName   string
 	CreatedAt    time.Time
+	// ExpiresAt is when PurgeExpired may delete this registration. Never
+	// zero for a record written by this package.
+	ExpiresAt time.Time
 }
 
 // HasRedirectURI reports whether uri exactly matches one of the client's
@@ -250,6 +301,9 @@ type PendingAuth struct {
 // Every token issued by rotating an earlier one keeps the same FamilyID and
 // FamilyCreatedAt: the family is the unit of revocation (on reuse detection)
 // and of the absolute lifetime cap.
+// A row is ALSO the durable reuse-detection ledger: it is not deleted when the
+// token is rotated away, only stamped with ConsumedAt, and it survives until
+// both ExpiresAt and FamilyExpiresAt have passed.
 type RefreshToken struct {
 	TokenHash string
 	ClientID  string
@@ -260,6 +314,19 @@ type RefreshToken struct {
 	// FamilyCreatedAt is when the chain started (the original login), not
 	// when this particular token was minted.
 	FamilyCreatedAt time.Time
+	// FamilyExpiresAt is FamilyCreatedAt + Config.RefreshTokenAbsoluteTTL: the
+	// instant the whole chain dies no matter how often it was rotated. The row
+	// must be retained until then even after it was consumed.
+	FamilyExpiresAt time.Time
 	ExpiresAt       time.Time
 	CreatedAt       time.Time
+	// ConsumedAt is when this token was rotated away. Zero means it has never
+	// been used. Set only by Store.ConsumeRefreshToken, and never overwritten
+	// once set.
+	ConsumedAt time.Time
+	// SuccessorSealed is the encrypted successor token attached by
+	// Store.LinkRefreshSuccessor. It is opaque to the Store: persist the bytes
+	// and give them back unchanged. Only a caller who presents the raw
+	// predecessor token can decrypt it, so a database leak reveals nothing.
+	SuccessorSealed []byte
 }

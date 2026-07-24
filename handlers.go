@@ -143,11 +143,15 @@ func (p *Provider) Register() http.HandlerFunc {
 			return
 		}
 
+		// Registration is unauthenticated, so a fresh client is short-lived
+		// until it actually completes a login (see extendClient).
+		now := p.now()
 		client := Client{
 			ClientID:     clientID,
 			RedirectURIs: req.RedirectURIs,
 			ClientName:   req.ClientName,
-			CreatedAt:    p.now(),
+			CreatedAt:    now,
+			ExpiresAt:    now.Add(p.cfg.UnusedClientTTL),
 		}
 		if err := p.store.SaveClient(r.Context(), client); err != nil {
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not persist client")
@@ -367,7 +371,7 @@ func (p *Provider) authorizeConsent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.setBinderCookie(w, binder)
+	p.addBinder(w, r, binder)
 	p.renderConsent(w, r, client, ConsentRequest{
 		RedirectURI: redirectURI,
 		Scopes:      strings.Fields(GrantedScope),
@@ -406,7 +410,7 @@ func (p *Provider) authorizeApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !p.binderMatches(r, pending.BinderHash) {
-		p.clearBinderCookie(w)
+		p.dropBinder(w, r, pending.BinderHash)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request",
 			"this approval did not come from the browser that started the authorization request")
 		return
@@ -479,7 +483,7 @@ func (p *Provider) GoogleCallback() http.HandlerFunc {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unknown, expired or already used state")
 			return
 		}
-		p.clearBinderCookie(w)
+		p.dropBinder(w, r, pending.BinderHash)
 		if !pending.Approved {
 			// A record that never passed the consent step (its handle is the
 			// consent nonce, not a Google state).
@@ -553,6 +557,10 @@ func (p *Provider) GoogleCallback() http.HandlerFunc {
 			return
 		}
 
+		// The registration has now been used to complete a login, so it stops
+		// being a throwaway row.
+		p.extendClient(r.Context(), pending.ClientID, now)
+
 		params := url.Values{"code": {rawCode}}
 		if pending.ClientState != "" {
 			params.Set("state", pending.ClientState)
@@ -560,6 +568,22 @@ func (p *Provider) GoogleCallback() http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, appendQuery(pending.RedirectURI, params), http.StatusFound)
 	}
+}
+
+// extendClient pushes a client's expiry out to Config.ClientTTL once it has
+// completed a login. Failures are ignored: this is housekeeping, and losing it
+// only means the registration expires earlier than it should.
+func (p *Provider) extendClient(ctx context.Context, clientID string, now time.Time) {
+	c, ok, err := p.store.GetClient(ctx, clientID)
+	if err != nil || !ok {
+		return
+	}
+	want := now.Add(p.cfg.ClientTTL)
+	if !c.ExpiresAt.Before(want) {
+		return
+	}
+	c.ExpiresAt = want
+	_ = p.store.SaveClient(ctx, c)
 }
 
 // redirectClientError sends an OAuth error back to the client's registered
@@ -674,9 +698,28 @@ func (p *Provider) authorizationCodeGrant(w http.ResponseWriter, r *http.Request
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not start a token family")
 		return
 	}
-	p.issueTokenPair(r.Context(), w, ac.ClientID, ac.UserID, familyID, p.now())
+	p.issueTokenPair(r.Context(), w, rotation{}, ac.ClientID, ac.UserID, familyID, p.now())
 }
 
+// rotation identifies the refresh token a new pair is descended from, so the
+// predecessor's row can be linked to its successor. The zero value means "this
+// is a fresh login, there is no predecessor".
+type rotation struct {
+	raw  string
+	hash string
+}
+
+// refreshTokenGrant rotates a refresh token.
+//
+// Store.ConsumeRefreshToken does not delete: it stamps ConsumedAt and returns
+// the row as it was, which is what makes the three cases distinguishable
+// durably — across restarts, and however many times an attacker rotates.
+//
+//	unknown hash              -> invalid_grant, nothing is revoked.
+//	row with zero  ConsumedAt -> legitimate rotation.
+//	row with a set ConsumedAt -> replay: either a duplicate submission inside
+//	                             Config.RefreshGracePeriod (answered with the
+//	                             same successor) or REUSE (family revoked).
 func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 	raw := r.PostFormValue("refresh_token")
 	clientID := r.PostFormValue("client_id")
@@ -687,27 +730,20 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 	now := p.now()
 	tokenHash := HashSecret(raw)
 
-	// Rotation: consuming invalidates the presented token unconditionally.
-	rt, ok, err := p.store.ConsumeRefreshToken(r.Context(), tokenHash)
+	rt, ok, err := p.store.ConsumeRefreshToken(r.Context(), tokenHash, now)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not load refresh token")
 		return
 	}
 	if !ok {
-		// A miss on a token we rotated away recently is refresh-token REUSE:
-		// either the legitimate client or a thief is replaying a token that is
-		// already spent, and we cannot tell which. Kill the whole family so
-		// the other holder's chain dies too.
-		if familyID, reused := p.familyOfConsumedRefresh(tokenHash, now); reused {
-			if err := p.store.RevokeRefreshTokenFamily(r.Context(), familyID); err != nil {
-				writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not revoke the token family")
-				return
-			}
-		}
+		// Never issued, or the family is already gone (revoked or purged).
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token is invalid or already used")
 		return
 	}
-	p.rememberConsumedRefresh(tokenHash, rt.FamilyID, now)
+	if !rt.ConsumedAt.IsZero() {
+		p.replayedRefreshToken(w, r, rt, raw, clientID, now)
+		return
+	}
 
 	if !now.Before(rt.ExpiresAt) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
@@ -735,33 +771,128 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.issueTokenPair(r.Context(), w, rt.ClientID, rt.UserID, rt.FamilyID, familyStart)
+	// Fail closed on a token with no family: rather than propagate the
+	// emptiness (which would opt the whole chain out of reuse detection and the
+	// absolute cap), start a family here. LinkRefreshSuccessor stamps it back
+	// onto this row so a later replay of it still revokes the new family.
+	familyID := rt.FamilyID
+	if familyID == "" {
+		if familyID, err = randomToken(16); err != nil {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not start a token family")
+			return
+		}
+	}
+
+	p.issueTokenPair(r.Context(), w, rotation{raw: raw, hash: tokenHash},
+		rt.ClientID, rt.UserID, familyID, familyStart)
 }
 
-func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, clientID, userID, familyID string, familyCreatedAt time.Time) {
-	now := p.now()
-
-	access, err := p.issueAccessToken(userID, now)
-	if err != nil {
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue access token")
+// replayedRefreshToken handles a token that was already rotated away.
+//
+// Inside Config.RefreshGracePeriod, and only for the token that was consumed
+// most recently in its family whose successor is still unused, this is treated
+// as a duplicate submission and answered with the same refresh token the
+// original rotation issued. That keeps a client that lost the response (or
+// fired two requests at once) from destroying its own session.
+//
+// Everything else is refresh-token REUSE: either the legitimate client or a
+// thief is replaying a spent token and we cannot tell which, so the whole
+// family dies and both holders have to sign in again.
+func (p *Provider) replayedRefreshToken(w http.ResponseWriter, r *http.Request, rt RefreshToken, raw, clientID string, now time.Time) {
+	if p.graceApplies(r.Context(), rt, raw, clientID, now) {
+		successor, ok := p.openSuccessor(raw, rt.SuccessorSealed)
+		if ok {
+			p.writeTokenPair(w, rt.UserID, successor, now)
+			return
+		}
+		// The winning rotation has not attached its successor yet (a genuinely
+		// concurrent duplicate). Fail this attempt, but never revoke: the
+		// caller retries and the family stays alive.
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant",
+			"this refresh token is being rotated by another request; retry")
 		return
 	}
+
+	if rt.FamilyID != "" {
+		if err := p.store.RevokeRefreshTokenFamily(r.Context(), rt.FamilyID); err != nil {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not revoke the token family")
+			return
+		}
+	}
+	writeOAuthError(w, http.StatusBadRequest, "invalid_grant",
+		"refresh token was already used; the whole token family has been revoked, sign in again")
+}
+
+// graceApplies reports whether a replayed token qualifies for the idempotent
+// grace window. Every condition is deliberately narrow.
+func (p *Provider) graceApplies(ctx context.Context, rt RefreshToken, raw, clientID string, now time.Time) bool {
+	if p.cfg.RefreshGracePeriod <= 0 || rt.ConsumedAt.IsZero() {
+		return false
+	}
+	if now.Before(rt.ConsumedAt) || now.After(rt.ConsumedAt.Add(p.cfg.RefreshGracePeriod)) {
+		return false
+	}
+	if rt.ClientID != clientID {
+		return false
+	}
+	if len(rt.SuccessorSealed) == 0 {
+		// Mid-rotation: no successor yet, but this is still not reuse.
+		return true
+	}
+	successor, ok := p.openSuccessor(raw, rt.SuccessorSealed)
+	if !ok {
+		return false
+	}
+	// The family must not have moved on: if the successor was itself already
+	// rotated away, this replay is a token that is two steps stale, which is
+	// reuse however recent it is.
+	next, found, err := p.store.GetRefreshToken(ctx, HashSecret(successor))
+	if err != nil || !found {
+		return false
+	}
+	return next.ConsumedAt.IsZero() && now.Before(next.ExpiresAt)
+}
+
+// issueTokenPair mints a new access/refresh pair, persists the refresh token
+// and, when this is a rotation, seals the new refresh token onto the row of the
+// token it replaces.
+func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, prev rotation, clientID, userID, familyID string, familyCreatedAt time.Time) {
+	now := p.now()
+
 	refresh, err := randomToken(32)
 	if err != nil {
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue refresh token")
 		return
 	}
 	// The sliding window never outlives the absolute cap.
+	familyExpiresAt := familyCreatedAt.Add(p.cfg.RefreshTokenAbsoluteTTL)
 	expiresAt := now.Add(p.cfg.RefreshTokenTTL)
-	if absolute := familyCreatedAt.Add(p.cfg.RefreshTokenAbsoluteTTL); absolute.Before(expiresAt) {
-		expiresAt = absolute
+	if familyExpiresAt.Before(expiresAt) {
+		expiresAt = familyExpiresAt
 	}
+
+	// Link the predecessor first: once the new token exists, a duplicate
+	// submission must be able to find the successor rather than be told the
+	// rotation is still in flight.
+	if prev.hash != "" {
+		sealed, err := p.sealSuccessor(prev.raw, refresh)
+		if err != nil {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not seal the rotated token")
+			return
+		}
+		if err := p.store.LinkRefreshSuccessor(ctx, prev.hash, familyID, sealed); err != nil {
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not record the token rotation")
+			return
+		}
+	}
+
 	if err := p.store.SaveRefreshToken(ctx, RefreshToken{
 		TokenHash:       HashSecret(refresh),
 		ClientID:        clientID,
 		UserID:          userID,
 		FamilyID:        familyID,
 		FamilyCreatedAt: familyCreatedAt,
+		FamilyExpiresAt: familyExpiresAt,
 		ExpiresAt:       expiresAt,
 		CreatedAt:       now,
 	}); err != nil {
@@ -769,6 +900,18 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, cl
 		return
 	}
 
+	p.writeTokenPair(w, userID, refresh, now)
+}
+
+// writeTokenPair mints a fresh access token for userID and writes the token
+// response. The refresh token is passed in because a grace-window replay
+// returns the one that already exists rather than minting another.
+func (p *Provider) writeTokenPair(w http.ResponseWriter, userID, refresh string, now time.Time) {
+	access, err := p.issueAccessToken(userID, now)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not issue access token")
+		return
+	}
 	writeJSON(w, http.StatusOK, tokenResponse{
 		AccessToken:  access,
 		TokenType:    "Bearer",

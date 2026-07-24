@@ -85,17 +85,19 @@ Two independent defences:
    | | |
    |---|---|
    | name | `__Host-mcpoauth_binder` (`mcpoauth_binder` when `InsecureDevMode` is set) |
-   | value | 32 random bytes, base64url — only its SHA-256 is persisted, on the `PendingAuth` row |
+   | value | up to 5 binders, `.`-separated, newest first — each 32 random bytes, base64url. Only the SHA-256 of one binder is persisted, on the `PendingAuth` row |
    | flags | `HttpOnly`, `Secure`, `SameSite=Lax`, `Path=/`, no `Domain` |
 
-   `GoogleCallback` refuses to mint an authorization code unless the browser presents the cookie matching the pending record (constant-time compare), and burns the record either way. This kills the cross-browser variant even if consent were bypassed. The cookie is cleared once the flow ends.
+   `GoogleCallback` refuses to mint an authorization code unless the browser presents a cookie containing the binder that matches the pending record (constant-time compare against each value), and burns the record either way. This kills the cross-browser variant even if consent were bypassed. Only the binder a finished flow used is removed from the cookie; the others stay.
+
+   The cookie holds a *list* so that several flows can be in progress in one browser. A browser keeps only one cookie per name, so a single-valued cookie meant that opening a second `/authorize` (a second tab, or a retry) silently broke the first one.
 
 What this requires of your deployment:
 
-- **HTTPS.** `__Host-` and `Secure` mean the cookie only travels over TLS. For plain-http local development set `Config.InsecureDevMode = true` — never in production.
+- **HTTPS.** `__Host-` and `Secure` mean the cookie only travels over TLS. For plain-http local development set `Config.InsecureDevMode = true` — `New` only accepts it when `Issuer` is `http://` on a loopback host, so it cannot be left on by accident.
 - **The cookie must survive the Google round trip.** `SameSite=Lax` is correct and deliberate: the return from Google is a top-level `GET` navigation, which `Lax` allows and `Strict` would block. Do not tighten it.
 - **Same origin throughout.** `AuthorizeURL` and `GoogleRedirectURL` must be on the host that set the cookie — already true for any normal deployment.
-- One browser runs one flow at a time: starting a second `/authorize` overwrites the cookie and abandons the first.
+- Up to 5 authorization flows can be in progress in one browser at once. Starting a sixth pushes the oldest binder out of the cookie, abandoning that flow.
 
 ### Restyling the consent page
 
@@ -165,9 +167,19 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Housekeeping: nothing else deletes expired codes, pending requests or
-	// refresh tokens. The provider purges opportunistically at most once every
-	// Config.PurgeInterval, which is only a backstop for an idle deployment.
+	// REQUIRED at startup. Round-trips canary records through your Store and
+	// fails loudly if a field or a guarantee did not survive. A Store that
+	// drops BinderHash, FamilyID, FamilyCreatedAt or ConsumedAt keeps working
+	// perfectly while silently disabling a security control — this is the only
+	// thing that catches that.
+	if err := provider.VerifyStore(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+
+	// Housekeeping: nothing else deletes expired codes, pending requests,
+	// refresh tokens or stale client registrations. The provider purges
+	// opportunistically at most once every Config.PurgeInterval, which is only
+	// a backstop for an idle deployment.
 	go func() {
 		for range time.Tick(10 * time.Minute) {
 			if err := provider.PurgeExpired(context.Background()); err != nil {
@@ -267,7 +279,7 @@ You implement persistence; the package never touches a database.
 
 ```go
 type Store interface {
-	SaveClient(ctx context.Context, c Client) error
+	SaveClient(ctx context.Context, c Client) error   // upsert on ClientID
 	GetClient(ctx context.Context, clientID string) (Client, bool, error)
 
 	SaveAuthCode(ctx context.Context, code AuthCode) error
@@ -277,7 +289,9 @@ type Store interface {
 	ConsumePendingAuth(ctx context.Context, stateHash string) (PendingAuth, bool, error)
 
 	SaveRefreshToken(ctx context.Context, rt RefreshToken) error
-	ConsumeRefreshToken(ctx context.Context, tokenHash string) (RefreshToken, bool, error)
+	GetRefreshToken(ctx context.Context, tokenHash string) (RefreshToken, bool, error)
+	ConsumeRefreshToken(ctx context.Context, tokenHash string, consumedAt time.Time) (RefreshToken, bool, error)
+	LinkRefreshSuccessor(ctx context.Context, tokenHash, familyID string, sealed []byte) error
 	RevokeRefreshTokensForUser(ctx context.Context, userID string) error
 	RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
 
@@ -287,30 +301,102 @@ type Store interface {
 }
 ```
 
-`PendingAuth` carries `BinderHash string` and `Approved bool`; `RefreshToken` carries `FamilyID string` and `FamilyCreatedAt time.Time`. Persist and return them like every other field — the provider's binding and family-revocation logic is worthless if they are dropped on the floor.
+**Every field of every struct must round-trip.** Dropping one does not break the flow, it disables a defence:
 
-Four rules:
+| Field | Dropping it means |
+|---|---|
+| `PendingAuth.BinderHash` | the browser binding is gone — the authorization hijack works again |
+| `PendingAuth.Approved` | the consent step can be skipped |
+| `RefreshToken.FamilyID` | reuse detection has nothing to revoke |
+| `RefreshToken.FamilyCreatedAt` | the absolute session cap turns back into a session that slides forever |
+| `RefreshToken.FamilyExpiresAt` | consumed rows are purged early, so reuse stops being detectable |
+| `RefreshToken.ConsumedAt` | a replayed refresh token looks like a first use — no detection at all |
+| `RefreshToken.SuccessorSealed` | a duplicate refresh submission logs the client out |
+| `Client.ExpiresAt` | client registrations become permanent and unbounded |
 
-1. **`Consume*` must be atomic and single-use.** A concurrent second call for the same hash must return `ok=false`. In PostgreSQL that is one statement:
+`Provider.VerifyStore(ctx)` checks all of this at startup. **Call it. Treat a failure as fatal.**
+
+### Suggested PostgreSQL schema
+
+```sql
+CREATE TABLE mcp_oauth_clients (
+    client_id      TEXT PRIMARY KEY,
+    redirect_uris  JSONB       NOT NULL,
+    client_name    TEXT        NOT NULL DEFAULT '',
+    created_at     TIMESTAMPTZ NOT NULL,
+    expires_at     TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE mcp_oauth_refresh_tokens (
+    token_hash        TEXT PRIMARY KEY,
+    client_id         TEXT        NOT NULL,
+    user_id           TEXT        NOT NULL,
+    family_id         TEXT        NOT NULL,
+    family_created_at TIMESTAMPTZ NOT NULL,
+    family_expires_at TIMESTAMPTZ NOT NULL,
+    expires_at        TIMESTAMPTZ NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL,
+    consumed_at       TIMESTAMPTZ,          -- NULL = never used
+    successor_sealed  BYTEA                 -- opaque; store verbatim
+);
+CREATE INDEX ON mcp_oauth_refresh_tokens (family_id);
+```
+
+(`mcp_oauth_auth_codes` and `mcp_oauth_pending_auth` are the obvious column-per-field tables, keyed by `code_hash` / `state_hash`.)
+
+Six rules:
+
+1. **`ConsumeAuthCode` and `ConsumePendingAuth` must be atomic and single-use.** A concurrent second call for the same hash must return `ok=false`. In PostgreSQL that is one statement:
 
    ```sql
    DELETE FROM mcp_oauth_auth_codes WHERE code_hash = $1
    RETURNING code_hash, client_id, user_id, redirect_uri, code_challenge, expires_at, created_at;
    ```
 
-2. **`FindUserIDByEmail` must not create users.** Returning `ok=false` is how you refuse a stranger.
+2. **`ConsumeRefreshToken` must NOT delete.** This is the one that changed, and the one that matters most. The row *is* the reuse-detection ledger: it is stamped, kept, and only removed by `PurgeExpired`. It must return the row **as it was before the call**, so the provider can tell the three cases apart:
 
-3. **`RevokeRefreshTokenFamily` must delete every token sharing the `family_id`** — one `DELETE FROM mcp_oauth_refresh_tokens WHERE family_id = $1`. It is called when a rotated-away token is replayed, which is the canonical signal that a refresh token leaked; a no-op implementation silently disables the defence.
+   | return | meaning |
+   |---|---|
+   | `ok=false` | never issued, or the family is already revoked/purged → `invalid_grant` |
+   | `ok=true`, `ConsumedAt` zero | first use → a legitimate rotation |
+   | `ok=true`, `ConsumedAt` set | replay → duplicate submission (inside `RefreshGracePeriod`) or **reuse**, which revokes the family |
 
-4. **`PurgeExpired` must be safe to call concurrently with everything else.** One statement per table:
+   `consumed_at` must be stamped exactly once (never overwritten) and exactly one of N concurrent callers may see it unset:
+
+   ```sql
+   WITH before AS (
+       SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = $1 FOR UPDATE
+   ), stamped AS (
+       UPDATE mcp_oauth_refresh_tokens SET consumed_at = $2
+       WHERE token_hash = $1 AND consumed_at IS NULL
+   )
+   SELECT * FROM before;
+   ```
+
+   This is what makes detection **durable**: it survives a restart, and it cannot be evicted by an attacker who rotates a stolen token in a loop.
+
+3. **`LinkRefreshSuccessor` attaches the sealed successor and re-stamps the family**, on the row that was just consumed. `sealed` is an opaque encrypted blob — persist the bytes, return them unchanged, never interpret them. Only a caller presenting the raw predecessor token can decrypt it, so a dump of this table reveals no tokens.
+
+   ```sql
+   UPDATE mcp_oauth_refresh_tokens
+   SET family_id = $2, successor_sealed = $3
+   WHERE token_hash = $1;   -- unknown hash: no-op, return nil
+   ```
+
+4. **`RevokeRefreshTokenFamily` must delete every token sharing the `family_id`**, consumed rows included — one `DELETE FROM mcp_oauth_refresh_tokens WHERE family_id = $1`. It is called when a rotated-away token is replayed, which is the canonical signal that a refresh token leaked; a no-op implementation silently disables the defence.
+
+5. **`FindUserIDByEmail` must not create users.** Returning `ok=false` is how you refuse a stranger.
+
+6. **`PurgeExpired` must be safe to call concurrently with everything else**, and it now covers four tables. Note the refresh-token condition: a consumed row is retained until its **family** dies, which is much later than its own `expires_at`.
 
    ```sql
    DELETE FROM mcp_oauth_auth_codes     WHERE expires_at < $1;
    DELETE FROM mcp_oauth_pending_auth   WHERE expires_at < $1;
-   DELETE FROM mcp_oauth_refresh_tokens WHERE expires_at < $1;
+   DELETE FROM mcp_oauth_refresh_tokens WHERE expires_at < $1 AND family_expires_at < $1;
+   DELETE FROM mcp_oauth_clients        WHERE expires_at < $1;
    ```
 
-   Expiry is still checked by the provider, so `Consume*` may return expired rows — but nothing else deletes them. `/authorize` is unauthenticated, so without a purge the pending table grows forever. **Run `Provider.PurgeExpired` from a ticker** (see the mounting example); the provider's own opportunistic call, throttled to once per `Config.PurgeInterval`, is only a backstop.
+   Expiry is still checked by the provider, so `Consume*` may return expired rows — but nothing else deletes them. `/authorize` and `/register` are unauthenticated, so without a purge those tables grow forever. **Run `Provider.PurgeExpired` from a ticker** (see the mounting example); the provider's own opportunistic call, throttled to once per `Config.PurgeInterval`, is only a backstop.
 
 `github.com/obad2015/mcp-oauth/memstore` ships a ready-made in-memory implementation (`memstore.NewMemoryStore()`) for tests and local development.
 
@@ -335,23 +421,44 @@ There is no magic env reading — you pass a `Config`. A conventional set:
 | `MCP_OAUTH_JWT_SECRET` | input keying material for the access-token signature — **32+ random bytes, required** |
 | `PUBLIC_BASE_URL` | the issuer, e.g. `https://finance.example.com` |
 
-`New` rejects a `JWTSecret` shorter than 32 bytes. It may be the same secret your app already uses for session JWTs: the actual signing key is derived from it, so the two can never collide (see below). A separate secret is still preferable.
+`New` rejects a `JWTSecret` shorter than 32 bytes, and also one that uses fewer than 8 distinct byte values — `"aaaa…"` padded to length is a placeholder, not a secret. Neither check measures entropy; nothing can. Generate it properly: `openssl rand -base64 32`.
+
+It may be the same secret your app already uses for session JWTs: the actual signing key is derived from it, so the two can never collide (see below). A separate secret is still preferable.
 
 ## Configuration reference (beyond the required URLs)
 
 | Field | Default | What it does |
 |---|---|---|
-| `JWTSecret` | — | ≥32 bytes; the HS256 key is HKDF-derived from it |
+| `JWTSecret` | — | ≥32 bytes and ≥8 distinct byte values; the HS256 key is HKDF-derived from it |
 | `AccessTokenTTL` | 1h | access-token lifetime |
 | `RefreshTokenTTL` | 30d | sliding refresh lifetime, recomputed on each rotation |
-| `RefreshTokenAbsoluteTTL` | 90d | hard cap on a refresh **family**, measured from the login |
-| `RefreshReuseWindow` | 24h | how long a rotated-away token hash is remembered for reuse detection |
+| `RefreshTokenAbsoluteTTL` | 90d | hard cap on a refresh **family**, measured from the login. Also how long consumed rows are retained for reuse detection |
+| `RefreshGracePeriod` | 30s | window in which re-presenting the token that was *just* rotated away returns the same successor instead of revoking the family. Negative disables it |
 | `AuthCodeTTL` | 5m | authorization-code lifetime |
 | `PendingAuthTTL` | 10m | lifetime of the consent + Google round trip |
+| `UnusedClientTTL` | 24h | how long a registered client that never completed a login is kept |
+| `ClientTTL` | 90d | how long a client is kept after its most recent completed login |
 | `PurgeInterval` | 5m | throttle on the provider's opportunistic `PurgeExpired` |
 | `ConsentHandler` | built-in page | render your own approval page |
 | `AllowedRedirectHosts` | empty (any https host) | allowlist of hosts an https `redirect_uri` may point at |
-| `InsecureDevMode` | false | plain-http local development: drops `__Host-`/`Secure` from the binder cookie |
+| `InsecureDevMode` | false | plain-http local development: drops `__Host-`/`Secure` from the binder cookie. `New` rejects it unless `Issuer` is `http://` on a loopback host |
+
+`RefreshReuseWindow` no longer exists. Reuse detection is not time-bounded any more: it lasts as long as the family does (`RefreshTokenAbsoluteTTL`) and lives in the Store rather than in process memory.
+
+### Rate-limit `/register`
+
+Dynamic client registration is unauthenticated by design — an MCP CLI client on a random loopback port cannot pre-register. `UnusedClientTTL` bounds how long the junk lives, but it does not bound how fast it arrives. Put a rate limit in front of the endpoint at the proxy:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=mcp_register:10m rate=10r/m;
+
+location = /api/mcp/oauth/register {
+    limit_req zone=mcp_register burst=5 nodelay;
+    proxy_pass http://api:8080;
+}
+```
+
+The authorization endpoint is worth the same treatment (a looser rate), since `GET /authorize` also writes a pending row.
 
 ## Security model
 
@@ -360,7 +467,11 @@ There is no magic env reading — you pass a `Config`. A conventional set:
 - **Google email must be verified** (`email_verified == true`) and the ID token is fully validated: RS256 signature against Google's JWKS (cached for the lifetime the response advertises), `iss ∈ {accounts.google.com, https://accounts.google.com}`, `aud == GoogleClientID`, `exp`. `alg: none`, HS256/RS256 confusion, an unknown `kid` and a missing `kid` are all rejected. If the JWKS endpoint is unreachable a cached key is served for at most **24h past its expiry**, then logins fail closed.
 - **Key separation, not just a claim.** The HS256 key is `HKDF-Expand(SHA-256, JWTSecret, "mcpoauth/v1/access-token")` — `JWTSecret` itself never signs or verifies anything. An application that passes the secret it already uses for session JWTs therefore ends up with two unrelated keys: a session token cannot be replayed against the MCP endpoint, **and** an MCP token cannot authenticate a web session, in either direction, even before any claim is inspected.
 - **`token_use="mcp_access"`.** Access tokens are HS256 JWTs with `iss`, `sub` (user id), `aud` (the MCP resource URL), `exp`, `iat`, `scope` and `token_use`. Validation requires **all** of signature, issuer, audience, expiry **and** `token_use == "mcp_access"`. As the mirror image, **your own session middleware should reject any token that carries a `token_use` claim** (or require its own distinct value) — belt and braces on top of the derived key.
-- **Refresh-token reuse revokes the family.** Rotation is single-use; every token descended from one login shares a `FamilyID`. Replaying a token that was already rotated away — the canonical leak signal — revokes the entire family through `RevokeRefreshTokenFamily`, so a thief's chain dies the moment the legitimate client (or the thief) tries the spent token. Detection uses an in-process ledger of recently consumed hashes (`RefreshReuseWindow`, bounded in size), so it is best-effort across a multi-instance deployment: a store can implement stronger cluster-wide detection underneath.
+- **Refresh-token reuse revokes the family, durably.** Rotation is single-use; every token descended from one login shares a `FamilyID`. Replaying a token that was already rotated away — the canonical leak signal — revokes the entire family through `RevokeRefreshTokenFamily`, so a thief's chain dies the moment the legitimate client (or the thief) tries the spent token. Detection state is the refresh-token row itself: consuming a token **stamps** `ConsumedAt` rather than deleting the row, and the row is retained until the family expires. It therefore survives a process restart or a redeploy, works across instances, and cannot be evicted — the old in-process ledger was capped at 4096 entries, so a thief could rotate a stolen token in a loop to flush out the evidence of their own theft.
+- **A refresh token with no family fails closed.** Rotating a row whose `FamilyID` is empty (written by older code, or by a Store that drops the column) mints a *fresh* family rather than propagating the emptiness, and stamps it back onto the consumed predecessor — so a later replay still revokes the chain it spawned. A row with no family timestamps at all is refused outright.
+- **Duplicate refresh submissions do not log you out.** A client that loses the rotation response, retries, or fires two requests at once used to destroy its own session: the retry looked exactly like a replay and revoked the family. Inside `RefreshGracePeriod` (30s) the token that was *just* rotated away is answered with the very same successor instead. The window is deliberately narrow: it applies only to the single most-recently-consumed token of a family, only while its successor is still unused, and only to the same `client_id`; anything older, anything later, or a family that has already moved on is treated as reuse. The successor is recovered by decrypting a blob sealed with a key derived from the presented token, so this costs no plaintext at rest — the database still holds nothing but hashes. Set `RefreshGracePeriod` negative for strict, zero-tolerance detection.
+- **Client registrations are leases.** `/register` is unauthenticated, so a registration that never completes a login is purged after `UnusedClientTTL` (24h) and one that has is kept for `ClientTTL` (90d) from its last login. Expiry is not a lockout — MCP clients re-register automatically. Rate-limit the endpoint at your proxy as well; see above.
+- **`InsecureDevMode` cannot be switched on in production.** It weakens the binder cookie, so `New` refuses it unless `Issuer` is an `http://` URL on `127.0.0.1`, `::1` or `localhost`.
 - **Refresh sessions have an absolute lifetime.** Rotation carries `FamilyCreatedAt` forward, so a stolen token cannot be kept alive indefinitely by rotating it just before expiry. Past `RefreshTokenAbsoluteTTL` the grant is refused and the family revoked; the user signs in again.
 - **Nothing secret is stored in the clear.** Authorization codes, refresh tokens, the pending Google state and the browser binder are persisted only as hex SHA-256 hashes. Raw values exist only in flight.
 - **Single use, everywhere.** Authorization codes, the consent nonce, pending state and refresh tokens are consumed atomically. A replayed code fails; a rotated refresh token fails. A code is burned even by a *failed* exchange.
@@ -381,13 +492,14 @@ Things this package deliberately does **not** do: scope negotiation (one fixed s
 | Symbol | Purpose |
 |---|---|
 | `New(cfg, store) (*Provider, error)` | validate config, build the provider |
+| `Provider.VerifyStore(ctx) error` | **call at startup**: round-trips canaries through the Store and reports every dropped field or broken guarantee |
 | `Provider.ProtectedResourceMetadata()` | RFC 9728 document |
 | `Provider.AuthorizationServerMetadata()` | RFC 8414 document |
 | `Provider.Register()` | RFC 7591 dynamic client registration |
 | `Provider.Authorize()` | authorization endpoint: GET renders consent, POST approves and goes to Google |
 | `Provider.GoogleCallback()` | upstream callback, mints the authorization code |
 | `Provider.Token()` | `authorization_code` + `refresh_token` grants |
-| `Provider.PurgeExpired(ctx)` | delete expired records — call it from a ticker |
+| `Provider.PurgeExpired(ctx)` | delete expired records (codes, pending, dead token families, stale clients) — call it from a ticker |
 | `Provider.Middleware(next)` | protects the MCP endpoint |
 | `Provider.ValidateAccessToken(s)` | validate a token yourself (for chaining) |
 | `Provider.Unauthorized(w)` | emit the standard 401 challenge |
@@ -397,7 +509,7 @@ Things this package deliberately does **not** do: scope negotiation (one fixed s
 | `ValidateRedirectURI(s)` | the redirect-URI policy, exported for reuse |
 | `HashSecret(s)` | the SHA-256 hashing used by the store contract |
 | `ConsentRequest`, `ConsentNonceField` | what a custom `ConsentHandler` renders and posts back |
-| `BinderCookieName`, `BinderCookieNameInsecure` | the browser-binding cookie names |
+| `BinderCookieName`, `BinderCookieNameInsecure`, `BinderCookieSep` | the browser-binding cookie names, and the separator between the binders of concurrent flows |
 
 The metadata and registration endpoints answer `OPTIONS` preflights and send `Access-Control-Allow-Origin: *`; MCP clients fetch them cross-origin.
 
@@ -417,7 +529,11 @@ Adversarial coverage, one suite per finding:
 - **Authorization hijack** — an attacker-registered client phishing a victim: the flow dies at the callback for every variant of "wrong browser", the pending record is burned so it cannot be retried, no code is ever delivered to the attacker's redirect URI and no token is mintable.
 - **Consent** — GET does not redirect to Google and its record is unusable on its own; approval is rejected without a nonce, with a forged nonce, with another flow's nonce, without the binder cookie and with someone else's; the nonce is single-use; hostile `client_name`/`redirect_uri` are escaped; a custom `ConsentHandler` is exercised end to end.
 - **Refresh families** — reuse revokes the family and stops the attacker's chain, revocation does not leak across families, honest rotation is unaffected; the absolute lifetime cap is enforced and does not slide.
-- **Config and input validation** — short `JWTSecret` rejected, the derived key differs from the input and neither verifies the other's tokens, `code_challenge` charset/length, oversized `state` and registration payloads, the redirect-host allowlist.
+- **Durable reuse detection** — the replay is still caught after 6000 rotations of the stolen chain (the old bounded ledger was flushed by exactly this), after a process restart onto the same Store, after 45 days, and after all three at once; a familyless token is re-familied rather than opted out; consumed rows survive a purge until their family dies.
+- **Refresh grace window** — a duplicate submission gets the same refresh token back and keeps its session; 32 concurrent grants leave exactly one usable token and it still works; a two-step-stale token, another client, or a replay past the window all revoke the family; the sealed successor is not recoverable from the stored row.
+- **`VerifyStore`** — ten deliberately broken Stores (dropping `BinderHash`, `FamilyID`, `FamilyCreatedAt`, `FamilyExpiresAt`, `SuccessorSealed`; deleting on consume; never stamping `ConsumedAt`; returning the post-update row; a replayable auth code; a purge that forgets clients) are each caught with a message naming the fault — and a compliant Store passes, twice, leaving nothing behind.
+- **Lifecycle** — `InsecureDevMode` is rejected against https and non-loopback issuers and accepted for loopback http; unused client registrations are purged and used ones are not; two authorization flows in one browser both complete, while an evicted or foreign binder is still refused.
+- **Config and input validation** — short *and* low-entropy `JWTSecret` rejected, the derived key differs from the input and neither verifies the other's tokens, `code_challenge` charset/length, oversized `state` and registration payloads, the redirect-host allowlist.
 - **Concurrency and methods** — 32 goroutines double-spending an authorization code and a refresh token (exactly one wins), and the 405 behaviour of every endpoint.
 
 `go test -race ./...` is green.

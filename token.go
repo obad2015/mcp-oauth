@@ -1,6 +1,8 @@
 package mcpoauth
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -19,8 +21,19 @@ import (
 // every issued access token.
 const accessTokenKeyInfo = "mcpoauth/v1/access-token"
 
-// minJWTSecretLen is the entropy floor New enforces on Config.JWTSecret.
-const minJWTSecretLen = 32
+// Sanity floors New enforces on Config.JWTSecret. They are NOT an entropy
+// measurement — nothing can measure the entropy of a given string — they only
+// reject the two shapes that show up in practice: a secret that is too short to
+// key HMAC-SHA256, and a padded or repeated placeholder such as "aaaa...".
+// A real secret is 32+ bytes from a CSPRNG.
+const (
+	minJWTSecretLen      = 32
+	minJWTSecretDistinct = 8
+)
+
+// refreshSuccessorKeyInfo is the HKDF info prefix for the key that seals a
+// rotation's successor token onto its consumed predecessor row.
+const refreshSuccessorKeyInfo = "mcpoauth/v1/refresh-successor|"
 
 // hkdfExpand is HKDF-Expand (RFC 5869 §2.3) with SHA-256. The input is already
 // a high-entropy secret (New enforces >= 32 bytes), so the extract step is not
@@ -47,6 +60,58 @@ func hkdfExpand(prk, info []byte, n int) []byte {
 // even if the token_use claim check were ever removed.
 func deriveSigningKey(secret []byte) []byte {
 	return hkdfExpand(secret, []byte(accessTokenKeyInfo), 32)
+}
+
+// successorKey derives the AES key that seals the successor of one specific
+// refresh token. The raw predecessor token is part of the derivation, so the
+// blob can only ever be opened by someone who presents that token — a dump of
+// the refresh-token table (which holds hashes only) is useless.
+func (p *Provider) successorKey(predecessorRaw string) []byte {
+	return hkdfExpand(p.signKey, []byte(refreshSuccessorKeyInfo+predecessorRaw), 32)
+}
+
+// sealSuccessor encrypts successorRaw so it can be handed back to a client that
+// re-presents predecessorRaw inside Config.RefreshGracePeriod.
+func (p *Provider) sealSuccessor(predecessorRaw, successorRaw string) ([]byte, error) {
+	gcm, err := newGCM(p.successorKey(predecessorRaw))
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("generating seal nonce: %w", err)
+	}
+	return gcm.Seal(nonce, nonce, []byte(successorRaw), []byte(HashSecret(predecessorRaw))), nil
+}
+
+// openSuccessor reverses sealSuccessor. ok=false for anything it cannot
+// authenticate, including a blob written for a different token.
+func (p *Provider) openSuccessor(predecessorRaw string, sealed []byte) (string, bool) {
+	gcm, err := newGCM(p.successorKey(predecessorRaw))
+	if err != nil {
+		return "", false
+	}
+	if len(sealed) < gcm.NonceSize() {
+		return "", false
+	}
+	nonce, ct := sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():]
+	plain, err := gcm.Open(nil, nonce, ct, []byte(HashSecret(predecessorRaw)))
+	if err != nil || len(plain) == 0 {
+		return "", false
+	}
+	return string(plain), true
+}
+
+func newGCM(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("creating cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("creating gcm: %w", err)
+	}
+	return gcm, nil
 }
 
 // Errors returned by ValidateAccessToken.
