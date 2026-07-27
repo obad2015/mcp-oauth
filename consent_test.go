@@ -245,6 +245,78 @@ func TestConsentStep(t *testing.T) {
 	})
 }
 
+// TestConsentCSP covers the form-action directive of the default consent
+// page's Content-Security-Policy header. On approval the server 302s the
+// browser to the configured Google authorization endpoint, and Chrome
+// enforces form-action against that redirect hop too — so the endpoint's
+// origin must be present in form-action or approval silently does nothing.
+func TestConsentCSP(t *testing.T) {
+	tests := []struct {
+		name          string
+		googleAuthURL string
+		wantForm      string
+	}{
+		{
+			name:          "custom GoogleAuthURL origin is derived, not hardcoded",
+			googleAuthURL: "https://login.example.com:8443/o/oauth2/v2/auth",
+			wantForm:      "form-action 'self' https://login.example.com:8443",
+		},
+		{
+			name:          "default GoogleAuthURL",
+			googleAuthURL: "https://accounts.google.com/o/oauth2/v2/auth",
+			wantForm:      "form-action 'self' https://accounts.google.com",
+		},
+		{
+			name:          "path, query and trailing slash do not leak into the header",
+			googleAuthURL: "https://login.example.com/o/oauth2/v2/auth?foo=bar",
+			wantForm:      "form-action 'self' https://login.example.com",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, func(c *mcpoauth.Config) { c.GoogleAuthURL = tc.googleAuthURL })
+			clientID := h.register(testRedirectURI)
+			rec := h.authorizeGET(authorizeParams(clientID, testRedirectURI))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+			}
+
+			csp := rec.Header().Get("Content-Security-Policy")
+			if !strings.Contains(csp, tc.wantForm+";") {
+				t.Fatalf("CSP = %q, want it to contain %q", csp, tc.wantForm+";")
+			}
+			for _, unchanged := range []string{
+				"default-src 'none'",
+				"style-src 'unsafe-inline'",
+				"frame-ancestors 'none'",
+			} {
+				if !strings.Contains(csp, unchanged) {
+					t.Errorf("CSP = %q, missing unchanged directive %q", csp, unchanged)
+				}
+			}
+			// Only the origin (scheme+host) may appear — a path or query in a
+			// CSP source would change matching semantics.
+			if strings.Contains(csp, "/o/oauth2") || strings.Contains(csp, "foo=bar") {
+				t.Fatalf("CSP leaks path/query from GoogleAuthURL: %q", csp)
+			}
+		})
+	}
+
+	t.Run("an unparseable GoogleAuthURL fails closed to form-action 'self'", func(t *testing.T) {
+		h := newHarness(t, func(c *mcpoauth.Config) { c.GoogleAuthURL = "://not a url" })
+		clientID := h.register(testRedirectURI)
+		rec := h.authorizeGET(authorizeParams(clientID, testRedirectURI))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+		}
+		csp := rec.Header().Get("Content-Security-Policy")
+		if !strings.Contains(csp, "form-action 'self';") {
+			t.Fatalf("CSP = %q, want a bare form-action 'self' fallback", csp)
+		}
+	})
+}
+
 // TestAuthorizationHijack is the adversarial scenario that motivated the
 // consent + browser-binding work: an attacker registers a client pointing at
 // their own server, generates an authorize URL, and phishes a victim with it.
