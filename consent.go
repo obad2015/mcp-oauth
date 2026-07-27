@@ -3,6 +3,7 @@ package mcpoauth
 import (
 	"html/template"
 	"net/http"
+	"net/url"
 )
 
 // defaultConsentTemplate is the built-in approval page.
@@ -50,6 +51,32 @@ gives whoever controls that address access to your data.</p>
 <p class="deny">To deny, just close this page.</p>
 </main></body></html>`))
 
+// consentCSP builds the Content-Security-Policy header for the default
+// consent page.
+//
+// The approval form POSTs same-origin, which "form-action 'self'" alone
+// would cover — but on success the server answers that POST with a 302 to
+// the configured Google authorization endpoint, and Chrome enforces
+// form-action against every hop of a redirect chain, not just the URL the
+// form initially targeted. Without also allow-listing Google's origin here,
+// Chrome silently blocks that redirect: the approval appears to do nothing,
+// the page just sits there, and the Google callback is never reached (this
+// is exactly what happened in production). The origin is derived from the
+// configured GoogleAuthURL rather than hardcoded to "accounts.google.com" so
+// this keeps working with Config.GoogleAuthURL overrides (tests point it at
+// an httptest server).
+func consentCSP(googleAuthURL string) string {
+	origin := ""
+	if u, err := url.Parse(googleAuthURL); err == nil && u.Scheme != "" && u.Host != "" {
+		origin = " " + u.Scheme + "://" + u.Host
+	}
+	// A URL that fails to parse, or has no scheme/host, falls back to a
+	// self-only policy instead of emitting a malformed or overly-permissive
+	// header (fail closed). GoogleAuthURL is not otherwise validated as an
+	// absolute URL by New(), so this is a real defensive fallback.
+	return "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'" + origin + "; frame-ancestors 'none'"
+}
+
 // consentPageData is the template model for the built-in page.
 type consentPageData struct {
 	ClientName  string
@@ -75,9 +102,9 @@ func (p *Provider) renderConsent(w http.ResponseWriter, r *http.Request, c Clien
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	// Belt and braces: the page has no external references, so this CSP can be
-	// maximally strict.
-	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+	// maximally strict — except form-action, which must also list the Google
+	// authorization endpoint's origin (see consentCSP).
+	w.Header().Set("Content-Security-Policy", consentCSP(p.cfg.GoogleAuthURL))
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.WriteHeader(http.StatusOK)
 	_ = defaultConsentTemplate.Execute(w, consentPageData{
