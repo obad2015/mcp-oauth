@@ -438,6 +438,23 @@ func (v *storeVerifier) checkRefreshToken() {
 			third.ConsumedAt.UTC(), consumedAt.UTC())
 	}
 
+	// GetRefreshToken must be UNFILTERED. Adding `AND consumed_at IS NULL` to it
+	// "by symmetry" with ConsumeRefreshToken is a natural mistake and a silent
+	// disaster: the Provider reads exactly this row twice on every rotation —
+	// the client-binding pre-check before consuming, and the post-rotation
+	// predecessor re-read that confirms the family was not revoked mid-flight.
+	// Filtered, the pre-check treats every refresh as an unknown token and the
+	// re-read never finds the predecessor, so every rotation revokes its own
+	// family. Nothing above catches it, because every earlier Get is of a row
+	// that has not been consumed yet.
+	if _, still, err := v.p.store.GetRefreshToken(v.ctx, hash); err != nil || !still {
+		v.failf("GetRefreshToken stopped returning the row once ConsumeRefreshToken had stamped " +
+			"it: it must not be filtered on consumed_at, expires_at or family_expires_at. The " +
+			"Provider reads consumed rows deliberately (the client-binding pre-check and the " +
+			"post-rotation predecessor re-read); filtering breaks both, and every rotation then " +
+			"revokes its own family")
+	}
+
 	if err := v.p.store.RevokeRefreshTokenFamily(v.ctx, adopted); err != nil {
 		v.failf("RevokeRefreshTokenFamily failed: %v", err)
 		return

@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The no-database path. `go test ./...` must stay green for anyone who clones
+  # the repo without a PostgreSQL server; the contract suite skips itself.
+  build:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go build
+        run: go build ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  # The Store contract against a real server. This library is the shared
+  # security-critical dependency of two production apps, and every one of its
+  # load-bearing invariants (the ConsumeRefreshToken CTE, the unfiltered
+  # GetRefreshToken, the purge retention rule) is a property of SQL that an
+  # in-memory Store cannot exercise.
+  postgres:
+    name: postgres contract
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: mcpoauth
+          POSTGRES_PASSWORD: mcpoauth
+          POSTGRES_DB: mcpoauth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mcpoauth"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          check-latest: true
+
+      - name: go test -race (with PostgreSQL)
+        env:
+          MCPOAUTH_TEST_POSTGRES: postgres://mcpoauth:mcpoauth@127.0.0.1:5432/mcpoauth_test?sslmode=disable
+        run: go test -race -count=1 ./...
+
+      - name: repeat the concurrency suites
+        env:
+          MCPOAUTH_TEST_POSTGRES: postgres://mcpoauth:mcpoauth@127.0.0.1:5432/mcpoauth_test?sslmode=disable
+        # The refresh subsystem produced four HIGH findings and three of them
+        # were races. Once is not evidence.
+        run: go test -race -count=5 -run 'Refresh|Grace|Concurrent|Postgres' ./...
