@@ -19,7 +19,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.24'
           check-latest: true
 
       - name: gofmt
@@ -75,7 +75,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.24'
           check-latest: true
 
       - name: go test -race (with PostgreSQL)
@@ -89,3 +89,44 @@ jobs:
         # The refresh subsystem produced four HIGH findings and three of them
         # were races. Once is not evidence.
         run: go test -race -count=5 -run 'Refresh|Grace|Concurrent|Postgres' ./...
+
+  # The framework adapters (mount/echomount, mount/ginmount). Each is its
+  # own module — see go.work at the repo root — specifically so the core
+  # module never depends on Echo or Gin; this job is what actually proves
+  # each one builds and mounts every Provider.Routes() entry without a
+  # duplicate-registration panic.
+  mount-modules:
+    name: mount adapters (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [mount/echomount, mount/ginmount]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ${{ matrix.module }})
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d ${{ matrix.module }}
+            exit 1
+          fi
+
+      - name: go build
+        working-directory: ${{ matrix.module }}
+        run: go build ./...
+
+      - name: go vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+
+      - name: go test -race
+        working-directory: ${{ matrix.module }}
+        run: go test -race -count=5 ./...
