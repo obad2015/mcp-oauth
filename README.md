@@ -8,7 +8,7 @@ Your app mints its **own** MCP access tokens. Google is only the identity step �
 go get github.com/obad2015/mcp-oauth
 ```
 
-Standard library + `github.com/golang-jwt/jwt/v5`. No web framework: every entry point is a plain `http.Handler` / `http.HandlerFunc`, so it drops into `net/http`, Echo, Gin, chi, whatever.
+Standard library + `github.com/golang-jwt/jwt/v5`. No web framework: every entry point is a plain `http.Handler` / `http.HandlerFunc`, so it drops into `net/http`, Echo, Gin, chi, whatever. Persistence is `github.com/obad2015/mcp-oauth/pgstore` (PostgreSQL over `database/sql`, no driver dependency); the only method your application writes is the one that looks up a user by email.
 
 ## Why this exists
 
@@ -161,18 +161,14 @@ func main() {
 
 		// Optional: bound where a redirect_uri may point (loopback always OK).
 		AllowedRedirectHosts: []string{"finance.example.com"},
-	}, myStore{db}) // your mcpoauth.Store implementation
+	}, store) // pgstore.New(db, pgstore.WithUserLookup(...)) — see "Persistence"
 
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// REQUIRED at startup. Round-trips canary records through your Store and
-	// fails loudly if a field or a guarantee did not survive. A Store that
-	// drops BinderHash, FamilyID, FamilyCreatedAt or ConsumedAt keeps working
-	// perfectly while silently disabling a security control — this is the only
-	// thing that catches that.
-	if err := provider.VerifyStore(context.Background()); err != nil {
+	// Creates/upgrades the four mcp_oauth_* tables. Idempotent.
+	if err := store.EnsureSchema(context.Background()); err != nil {
 		log.Fatal(err)
 	}
 
@@ -273,210 +269,66 @@ location ^~ /.well-known/oauth- {
 
 `MetadataBaseURL` only affects the URL advertised in the `WWW-Authenticate` challenge — set it to whatever base actually serves the documents (it defaults to `Issuer`).
 
-## The Store interface
+## Persistence
 
-You implement persistence; the package never touches a database.
+The package ships its own PostgreSQL store, so you implement **one** method:
 
 ```go
-type Store interface {
-	SaveClient(ctx context.Context, c Client) error   // upsert on ClientID
-	GetClient(ctx context.Context, clientID string) (Client, bool, error)
+import "github.com/obad2015/mcp-oauth/pgstore"
 
-	SaveAuthCode(ctx context.Context, code AuthCode) error
-	ConsumeAuthCode(ctx context.Context, codeHash string) (AuthCode, bool, error)
+store, err := pgstore.New(db, pgstore.WithUserLookup(
+	// The ONLY method that is yours, because only you know your users table.
+	// It must never create a user: ok=false is how a stranger is refused.
+	// Compare case-insensitively — see below.
+	func(ctx context.Context, email string) (string, bool, error) {
+		var id string
+		err := db.QueryRowContext(ctx,
+			`SELECT id::text FROM users WHERE LOWER(email) = LOWER($1)`, email).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return id, err == nil, err
+	}))
+if err != nil {
+	log.Fatal(err)
+}
 
-	SavePendingAuth(ctx context.Context, p PendingAuth) error
-	ConsumePendingAuth(ctx context.Context, stateHash string) (PendingAuth, bool, error)
-
-	SaveRefreshToken(ctx context.Context, rt RefreshToken) error
-	GetRefreshToken(ctx context.Context, tokenHash string) (RefreshToken, bool, error)
-	ConsumeRefreshToken(ctx context.Context, tokenHash string, consumedAt time.Time) (RefreshToken, bool, error)
-	LinkRefreshSuccessor(ctx context.Context, tokenHash, familyID string, sealed []byte) error
-	RevokeRefreshTokensForUser(ctx context.Context, userID string) error
-	RevokeRefreshTokenFamily(ctx context.Context, familyID string) error
-
-	PurgeExpired(ctx context.Context, before time.Time) error
-
-	FindUserIDByEmail(ctx context.Context, email string) (userID string, ok bool, err error)
+// Creates and upgrades the four mcp_oauth_* tables. Idempotent, safe at every
+// startup, safe from several instances at once, and it adopts a database whose
+// tables an earlier migration of yours created.
+if err := store.EnsureSchema(ctx); err != nil {
+	log.Fatal(err)
 }
 ```
 
-**Every field of every struct must round-trip.** Dropping one does not break the flow, it disables a defence:
+`db` is a plain `*sql.DB`, so `pgstore` has no driver dependency of its own:
 
-| Field | Dropping it means |
-|---|---|
-| `PendingAuth.BinderHash` | the browser binding is gone — the authorization hijack works again |
-| `PendingAuth.Approved` | the consent step can be skipped |
-| `RefreshToken.FamilyID` | reuse detection has nothing to revoke |
-| `RefreshToken.FamilyCreatedAt` | the absolute session cap turns back into a session that slides forever |
-| `RefreshToken.FamilyExpiresAt` | consumed rows are purged early, so reuse stops being detectable |
-| `RefreshToken.ConsumedAt` | a replayed refresh token looks like a first use — no detection at all |
-| `RefreshToken.SuccessorSealed` | a duplicate refresh submission logs the client out |
-| `Client.ExpiresAt` | client registrations become permanent and unbounded |
+- **lib/pq** — pass your `*sql.DB` directly.
+- **pgx/v5** — `stdlib.OpenDBFromPool(pool)`, one line.
 
-Round-tripping the fields is necessary and **not sufficient** — the rules below cover the behaviours that no column can express. `Provider.VerifyStore(ctx)` checks both at startup; see [What `VerifyStore` actually catches](#what-verifystore-actually-catches).
+Two things about that lookup are load-bearing:
 
-### Schema requirements before you write any DDL
+- **It must not create users.** Anything else is silent account provisioning: whoever controls a Google address controls a new account in your app.
+- **`LOWER()` on both sides.** The provider lowercases the verified Google email before calling you, while most signup paths store whatever casing Google returned. A plain `=` therefore locks out every user whose stored address has an uppercase character. This is a fixed production bug, not a micro-optimisation to undo.
 
-Three constraints apply to **all four** tables. They are not stylistic:
+Applications that own their DDL through a migration tool can use `pgstore.SchemaSQL` instead of `EnsureSchema` — but then the versioned upgrade steps are yours to carry too, and `EnsureSchema` is the supported path.
 
-- **No foreign keys.** Not between these tables, and not from them to your `users` table. The rows have independent lifetimes — a client registration expires long before the refresh tokens it issued, and `RevokeRefreshTokenFamily` deletes rows a pending record may still reference. `VerifyStore` also writes canary rows for a user that does not exist; an FK to `users` turns startup verification into a startup crash.
-- **`user_id` is `TEXT`.** If your application's user IDs are UUIDs and you want a `user_id UUID` column, that is fine — but then set `Config.VerifyStoreUserID` to a syntactically valid UUID, or `VerifyStore` will fail at startup trying to insert its default string canary. It must not be a real user's ID.
-- **`client_id` must hold at least 48 characters.** Issued client IDs are 32, so a `VARCHAR(32)` column works in production and fails only in `VerifyStore`, whose canary is 48. Use `TEXT`.
+`github.com/obad2015/mcp-oauth/memstore` is an in-memory `Store` for tests and local development.
 
-### PostgreSQL schema — all four tables
+### Writing your own Store
 
-```sql
-CREATE TABLE mcp_oauth_clients (
-    client_id      TEXT PRIMARY KEY,       -- must hold >= 48 chars (VerifyStore canary)
-    redirect_uris  JSONB       NOT NULL,
-    client_name    TEXT        NOT NULL DEFAULT '',
-    created_at     TIMESTAMPTZ NOT NULL,
-    expires_at     TIMESTAMPTZ NOT NULL
-);
+`mcpoauth.Store` stays public for backends `pgstore` cannot serve. It is a small interface with a very unforgiving contract: four of its clauses are individually load-bearing, and getting one wrong disables a security control **while the OAuth flow keeps working perfectly**. That is the whole reason this library ships a store at all.
 
-CREATE TABLE mcp_oauth_auth_codes (
-    code_hash      TEXT PRIMARY KEY,       -- sha256 hex of the authorization code
-    client_id      TEXT        NOT NULL,   -- NO foreign key
-    user_id        TEXT        NOT NULL,   -- NO foreign key
-    redirect_uri   TEXT        NOT NULL,
-    code_challenge TEXT        NOT NULL,   -- PKCE S256; without it PKCE is unenforceable
-    expires_at     TIMESTAMPTZ NOT NULL,
-    created_at     TIMESTAMPTZ NOT NULL
-);
+If you need to write one, everything you have to know is in **[STORE-CONTRACT.md](STORE-CONTRACT.md)** — the eight rules, the schema constraints, and `Provider.VerifyStore`, which round-trips canary records through your implementation and names every field or guarantee that did not survive. Run it from your test suite, against the real backend.
 
-CREATE TABLE mcp_oauth_pending_auth (
-    state_hash     TEXT PRIMARY KEY,       -- sha256 hex of the consent nonce OR the Google state
-    client_id      TEXT        NOT NULL,   -- NOT unique: two rows per flow share it
-    redirect_uri   TEXT        NOT NULL,
-    code_challenge TEXT        NOT NULL,
-    client_state   TEXT        NOT NULL DEFAULT '',
-    binder_hash    TEXT        NOT NULL,   -- browser binding; dropping it re-opens the hijack
-    approved       BOOLEAN     NOT NULL DEFAULT FALSE,  -- easy to forget; consent becomes skippable
-    expires_at     TIMESTAMPTZ NOT NULL,
-    created_at     TIMESTAMPTZ NOT NULL
-);
+## Upgrading to v2
 
-CREATE TABLE mcp_oauth_refresh_tokens (
-    token_hash        TEXT PRIMARY KEY,
-    client_id         TEXT        NOT NULL,
-    user_id           TEXT        NOT NULL,
-    family_id         TEXT        NOT NULL,
-    family_created_at TIMESTAMPTZ NOT NULL,
-    family_expires_at TIMESTAMPTZ NOT NULL,
-    expires_at        TIMESTAMPTZ NOT NULL,
-    created_at        TIMESTAMPTZ NOT NULL,
-    consumed_at       TIMESTAMPTZ,          -- NULL = never used. Stamped ONCE, never overwritten
-    successor_sealed  BYTEA                 -- opaque; store verbatim
-);
-CREATE INDEX ON mcp_oauth_refresh_tokens (family_id);
-CREATE INDEX ON mcp_oauth_refresh_tokens (expires_at, family_expires_at);
-```
+Two breaking changes, both in the same release, both absorbed by one small PR per application. **No user is logged out**: refresh-token rows, hashes and families are untouched, and a token issued by v1 keeps rotating in its own family straight through the upgrade.
 
-### Nine rules
+1. **Swap your `Store` for `pgstore`.** Delete your `oauth.go` (~300 lines of transcribed SQL) and replace the `VerifyStore` call at startup with `EnsureSchema`, as shown under [Persistence](#persistence). Keep your existing `mcp_oauth_*` migrations as history — `EnsureSchema` adopts the tables they created.
+2. **`Store` lost `LinkRefreshSuccessor`, and `RefreshToken` lost `SuccessorSealed`.** v1 sealed a rotation's successor onto the consumed predecessor row with AES-GCM so a duplicate submission could be answered even after a restart. v2 keeps that link in process instead, because losing it fails *safe* — the duplicate simply cannot be answered and the client signs in once — while the thing that must be durable, the `consumed_at` reuse ledger, has not moved. `EnsureSchema` drops the now-unused `successor_sealed` column as its first versioned step; nothing reads it, so there is nothing to restore on a rollback.
 
-1. **`ConsumeAuthCode` and `ConsumePendingAuth` must be atomic and single-use.** A concurrent second call for the same hash must return `ok=false`. In PostgreSQL that is one statement:
-
-   ```sql
-   DELETE FROM mcp_oauth_auth_codes WHERE code_hash = $1
-   RETURNING code_hash, client_id, user_id, redirect_uri, code_challenge, expires_at, created_at;
-   ```
-
-2. **`SavePendingAuth` is called TWICE per authorization flow, with two different primary keys.** Once for the consent nonce, once for the Google `state` — same `client_id`, different `state_hash`. It is a plain `INSERT`:
-
-   ```sql
-   INSERT INTO mcp_oauth_pending_auth
-       (state_hash, client_id, redirect_uri, code_challenge, client_state, binder_hash, approved, expires_at, created_at)
-   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9);
-   ```
-
-   An `UPDATE`, or an `ON CONFLICT (client_id) DO UPDATE`, silently loses the first record and every login then dies at the consent step with "unknown nonce". Do not put a unique constraint on `client_id`.
-
-3. **`ConsumeRefreshToken` must NOT delete, must NOT filter, and must stamp exactly once.** This is the one that matters most. The row *is* the reuse-detection ledger: it is stamped, kept, and only removed by `PurgeExpired`. It must return the row **as it was before the call**, so the provider can tell the three cases apart:
-
-   | return | meaning |
-   |---|---|
-   | `ok=false` | never issued, or the family is already revoked/purged → `invalid_grant` |
-   | `ok=true`, `ConsumedAt` zero | first use → a legitimate rotation |
-   | `ok=true`, `ConsumedAt` set | replay → duplicate submission (inside `RefreshGracePeriod`) or **reuse**, which revokes the family |
-
-   The correct idiom, one statement, at **`READ COMMITTED`** (PostgreSQL's default — see rule 5):
-
-   ```sql
-   WITH before AS (
-       SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = $1 FOR UPDATE
-   ), stamped AS (
-       UPDATE mcp_oauth_refresh_tokens SET consumed_at = $2
-       WHERE token_hash = $1 AND consumed_at IS NULL
-   )
-   SELECT * FROM before;
-   ```
-
-   Verified on PostgreSQL 17: 32 concurrent callers, exactly one winner, 12 runs out of 12.
-
-   **`AND consumed_at IS NULL` is load-bearing.** Drop it and the row is re-stamped on every call — while still returning the value from *before* that call, so first-use detection, replay detection and every round-trip check still look correct. What breaks is invisible: `RefreshGracePeriod` is anchored to `consumed_at`, so a rolling stamp converts the fixed 30-second window into an unbounded one. A stolen refresh token can then be replayed indefinitely, each replay handing back a fresh access token, and reuse detection **never fires**. Measured against a real PostgreSQL 17 store with the clause removed: 200 out of 200 replays of an already-consumed token accepted, spanning over an hour. `Provider.VerifyStore` consumes its canary **three** times specifically to catch this.
-
-   **Do not write the tempting shorter version:**
-
-   ```sql
-   -- WRONG. Do not use.
-   UPDATE mcp_oauth_refresh_tokens SET consumed_at = $2
-   WHERE token_hash = $1 AND consumed_at IS NULL
-   RETURNING *;
-   ```
-
-   It looks equivalent and is not. On a replay the `WHERE` matches nothing, so it returns **zero rows**, which the provider reads as `ok=false` — "unknown token". The replay of a leaked token becomes a plain `invalid_grant` and the family is never revoked. The failure is completely silent: the client sees the same 400 either way.
-
-   **Do not filter on `expires_at` either.** An *expired* `consumed_at`-stamped row is precisely the ledger entry that catches a token stolen weeks ago; `AND expires_at > now()` turns that replay into an ordinary `invalid_grant` with no revocation. The provider checks expiry itself. (The same licence *is* safe for `ConsumeAuthCode` and `ConsumePendingAuth` — those records are deleted on use and carry no history.)
-
-4. **`GetRefreshToken` must never be filtered, on anything — not `consumed_at`, not `expires_at`, not `family_expires_at`:**
-
-   ```sql
-   SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = $1;  -- never filtered, on anything (not consumed_at, not expiry)
-   ```
-
-   The provider calls this on an already-consumed row in two places: the `client_id` pre-check before a rotation, and the post-`LinkRefreshSuccessor` re-read that confirms the row it just wrote onto still exists. It is tempting to add `AND consumed_at IS NULL` by symmetry with `ConsumeRefreshToken` — do not. That breaks both callers: the pre-check treats every refresh as an unknown token, and the post-link re-read never finds the just-consumed predecessor, so every single rotation revokes its own family.
-
-5. **Isolation level: `READ COMMITTED`.** That is PostgreSQL's default and what the idiom above is written for. Under `REPEATABLE READ` or `SERIALIZABLE` the statement still yields exactly one winner, but concurrent callers get `SQLSTATE 40001` (`could not serialize access due to concurrent update`) and **you must catch it and retry** — an unhandled 40001 surfaces as a 500 on a perfectly ordinary parallel refresh. If your application runs everything inside a `REPEATABLE READ` transaction, either run these statements on their own connection or add the retry.
-
-6. **`LinkRefreshSuccessor` attaches the sealed successor and re-stamps the family**, on the row that was just consumed. `sealed` is an opaque encrypted blob — persist the bytes, return them unchanged, never interpret them. Only a caller presenting the raw predecessor token can decrypt it, so a dump of this table reveals no tokens.
-
-   ```sql
-   UPDATE mcp_oauth_refresh_tokens
-   SET family_id = $2, successor_sealed = $3
-   WHERE token_hash = $1;   -- unknown hash: no-op, return nil
-   ```
-
-   **Never make this an UPSERT.** An `INSERT ... ON CONFLICT` path mints a refresh-token row for a token that was never issued, carrying a caller-influenced `family_id`. An unknown hash must be a silent no-op returning `nil`.
-
-7. **`RevokeRefreshTokenFamily` must delete every token sharing the `family_id`**, consumed rows included — one `DELETE FROM mcp_oauth_refresh_tokens WHERE family_id = $1`. It is called when a rotated-away token is replayed, which is the canonical signal that a refresh token leaked; a no-op implementation silently disables the defence.
-
-8. **`FindUserIDByEmail` must not create users.** Returning `ok=false` is how you refuse a stranger.
-
-9. **`PurgeExpired` must be safe to call concurrently with everything else**, and it covers all four tables. Note the refresh-token condition: a consumed row is retained until its **family** dies, which is much later than its own `expires_at`.
-
-   ```sql
-   DELETE FROM mcp_oauth_auth_codes     WHERE expires_at < $1;
-   DELETE FROM mcp_oauth_pending_auth   WHERE expires_at < $1;
-   DELETE FROM mcp_oauth_refresh_tokens WHERE expires_at < $1 AND family_expires_at < $1;
-   DELETE FROM mcp_oauth_clients        WHERE expires_at < $1;
-   ```
-
-   `/authorize` and `/register` are unauthenticated, so without a purge those tables grow forever. **Run `Provider.PurgeExpired` from a ticker** (see the mounting example); the provider's own opportunistic call, throttled to once per `Config.PurgeInterval`, is only a backstop. `VerifyStore` is safe to run alongside that ticker: its canaries are written with a lifetime in the future and expired explicitly at the end.
-
-### What `VerifyStore` actually catches
-
-It round-trips a canary through every method and reports, in one error, each rule that was broken. It detects all of: a dropped `BinderHash`, `Approved`, `FamilyID`, `FamilyCreatedAt`, `FamilyExpiresAt`, `ConsumedAt` or `SuccessorSealed`; a `ConsumeRefreshToken` that deletes, that never stamps, that returns the row *after* stamping, that **overwrites** the stamp (rule 3), that filters expired rows, or that is not atomic under concurrent callers (fires 8 concurrent calls at one canary and requires exactly one zero `ConsumedAt`); a `LinkRefreshSuccessor` written as an upsert; a `SavePendingAuth` that loses one of the two records (rule 2); a replayable authorization code; a no-op `RevokeRefreshTokenFamily`; and a `PurgeExpired` that deletes a refresh-token row before its `family_expires_at` has passed, or that skips the **refresh-token or client** table entirely. It does *not* exercise `PurgeExpired` against the auth-code or pending-auth tables — those canaries are already consumed by the time cleanup runs, so a purge that forgets either of those two tables still passes.
-
-```go
-provider, err := mcpoauth.New(cfg, store)
-if err != nil { log.Fatal(err) }
-if err := provider.VerifyStore(ctx); err != nil { log.Fatal(err) }
-```
-
-**Call it. Treat a failure as fatal.** Every bug it finds is one that leaves the happy path working perfectly and only removes a defence.
-
-`github.com/obad2015/mcp-oauth/memstore` ships a ready-made in-memory implementation (`memstore.NewMemoryStore()`) for tests and local development, and is the reference for what compliant behaviour looks like.
+Also worth knowing: `VerifyStore` is no longer a startup ritual. It is a contract check for custom-`Store` authors, run from a test suite; `pgstore` is verified by this repository's CI against a real PostgreSQL server on every push.
 
 ## Google Cloud Console setup
 
@@ -511,7 +363,7 @@ It may be the same secret your app already uses for session JWTs: the actual sig
 | `AccessTokenTTL` | 1h | access-token lifetime |
 | `RefreshTokenTTL` | 30d | sliding refresh lifetime, recomputed on each rotation |
 | `RefreshTokenAbsoluteTTL` | 90d | hard cap on a refresh **family**, measured from the login. Also how long consumed rows are retained for reuse detection |
-| `RefreshGracePeriod` | 30s | window in which re-presenting the token that was *just* rotated away returns the same successor instead of revoking the family. Negative disables it |
+| `RefreshGracePeriod` | 30s | window in which re-presenting the token that was *just* rotated away returns the same successor instead of revoking the family. The link is in-process, so a duplicate arriving after a restart or on another instance costs one re-login and nothing more. Negative disables it |
 | `AuthCodeTTL` | 5m | authorization-code lifetime |
 | `PendingAuthTTL` | 10m | lifetime of the consent + Google round trip |
 | `UnusedClientTTL` | 24h | how long a registered client that never completed a login is kept |
@@ -520,7 +372,7 @@ It may be the same secret your app already uses for session JWTs: the actual sig
 | `ConsentHandler` | built-in page | render your own approval page |
 | `AllowedRedirectHosts` | empty (any https host) | allowlist of hosts an https `redirect_uri` may point at |
 | `InsecureDevMode` | false | plain-http local development: drops `__Host-`/`Secure` from the binder cookie. `New` rejects it unless **every** configured URL (`Issuer`, `ResourceURL`, `MetadataBaseURL`, `AuthorizeURL`, `TokenURL`, `RegisterURL`, `GoogleRedirectURL`) is `http://` on a loopback host |
-| `VerifyStoreUserID` | `"mcpoauth-verify-user"` | the user ID `VerifyStore` writes on its canary rows. Set it to a syntactic UUID if your `user_id` column is `UUID`. Must not be a real user |
+| `VerifyStoreUserID` | `"mcpoauth-verify-user"` | the user ID `VerifyStore` writes on its canary rows. Only relevant if you run `VerifyStore` against a **custom** Store whose `user_id` column is `UUID`. Must not be a real user |
 
 `RefreshReuseWindow` no longer exists. Reuse detection is not time-bounded any more: it lasts as long as the family does (`RefreshTokenAbsoluteTTL`) and lives in the Store rather than in process memory.
 
@@ -548,12 +400,12 @@ The authorization endpoint is worth the same treatment (a looser rate), since `G
 - **`token_use="mcp_access"`.** Access tokens are HS256 JWTs with `iss`, `sub` (user id), `aud` (the MCP resource URL), `exp`, `iat`, `scope` and `token_use`. Validation requires **all** of signature, issuer, audience, expiry **and** `token_use == "mcp_access"`. As the mirror image, **your own session middleware should reject any token that carries a `token_use` claim** (or require its own distinct value) — belt and braces on top of the derived key.
 - **Refresh-token reuse revokes the family, durably.** Rotation is single-use; every token descended from one login shares a `FamilyID`. Replaying a token that was already rotated away — the canonical leak signal — revokes the entire family through `RevokeRefreshTokenFamily`, so a thief's chain dies the moment the legitimate client (or the thief) tries the spent token. Detection state is the refresh-token row itself: consuming a token **stamps** `ConsumedAt` rather than deleting the row, and the row is retained until the family expires. It therefore survives a process restart or a redeploy, works across instances, and cannot be evicted — the old in-process ledger was capped at 4096 entries, so a thief could rotate a stolen token in a loop to flush out the evidence of their own theft.
 - **A refresh token is bound to its client before it is consumed.** A refresh grant presented with a `client_id` other than the one the token was issued to is refused *without* stamping `consumed_at`. Consuming first meant anyone who merely learned a refresh token could burn it with an arbitrary `client_id`, so the owner's next legitimate use was classified as reuse and killed the family — an unauthenticated logout of the victim, and a self-inflicted one on a typo. A client mismatch never revokes anything; a replay by the rightful client still does.
-- **A refresh token with no family fails closed.** Rotating a row whose `FamilyID` is empty (written by older code, or by a Store that drops the column) mints a *fresh* family rather than propagating the emptiness, and stamps it back onto the consumed predecessor — so a later replay still revokes the chain it spawned. A row with no family timestamps at all is refused outright.
-- **Duplicate refresh submissions do not log you out.** A client that loses the rotation response, retries, or fires two requests at once used to destroy its own session: the retry looked exactly like a replay and revoked the family. Inside `RefreshGracePeriod` (30s) the token that was *just* rotated away is answered with the very same successor instead. The window is deliberately narrow: it applies only to the single most-recently-consumed token of a family, only while its successor is still unused, and only to the same `client_id`; anything older, anything later, or a family that has already moved on is treated as reuse. It is bounded only on the *late* side — a duplicate whose clock runs behind the request that won the race is exactly what the window exists for, and on a multi-node deployment that is ordinary clock skew. The successor is recovered by decrypting a blob sealed with a key derived from the presented token, so this costs no plaintext at rest — the database still holds nothing but hashes. Set `RefreshGracePeriod` negative for strict, zero-tolerance detection.
+- **A refresh token with no family fails closed.** Rotating a row whose `FamilyID` is empty (written by older code, or by a Store that drops the column) starts a family rather than propagating the emptiness. That family is *derived* from the row's own token hash, not random, so a later replay of that same familyless token recomputes it and still revokes the chain it spawned — with no extra write and no extra Store method. A row with no family timestamps at all is refused outright.
+- **Duplicate refresh submissions do not log you out.** A client that loses the rotation response, retries, or fires two requests at once used to destroy its own session: the retry looked exactly like a replay and revoked the family. Inside `RefreshGracePeriod` (30s) the token that was *just* rotated away is answered with the very same successor instead. The window is deliberately narrow: it applies only to the single most-recently-consumed token of a family, only while its successor is still unused, and only to the same `client_id`; anything older, anything later, or a family that has already moved on is treated as reuse. It is bounded only on the *late* side — a duplicate whose clock runs behind the request that won the race is exactly what the window exists for, and on a multi-node deployment that is ordinary clock skew. The predecessor → successor link is held **in process**, capped and swept, so the database still holds nothing but hashes and there is no plaintext at rest anywhere. Losing that link (a restart, another instance) is not a security event: the duplicate simply cannot be answered, and it costs one re-login. The ledger it is judged against — the durable `consumed_at` stamp — is unaffected, so the window can never widen. Set `RefreshGracePeriod` negative for strict, zero-tolerance detection.
 - **Client registrations are leases.** `/register` is unauthenticated, so a registration that never completes a login is purged after `UnusedClientTTL` (24h) and one that has is kept for `ClientTTL` (90d) from its last login. Expiry is not a lockout — MCP clients re-register automatically. Rate-limit the endpoint at your proxy as well; see above.
 - **`InsecureDevMode` cannot be switched on in production.** It weakens the binder cookie, so `New` refuses it unless **every** configured URL — `Issuer`, `ResourceURL`, `MetadataBaseURL`, `AuthorizeURL`, `TokenURL`, `RegisterURL` and `GoogleRedirectURL` — is an `http://` URL on `127.0.0.1`, `::1` or `localhost`. Checking `Issuer` alone was not enough: a loopback issuer alongside a public https deployment stripped `__Host-`/`Secure` from the cookie on the real origin.
 - **Refresh sessions have an absolute lifetime.** Rotation carries `FamilyCreatedAt` forward, so a stolen token cannot be kept alive indefinitely by rotating it just before expiry. Past `RefreshTokenAbsoluteTTL` the grant is refused and the family revoked; the user signs in again.
-- **Reuse detection cannot be undone by a rotation already in flight.** A rotation persists its successor *before* linking it onto the predecessor, and then re-reads the predecessor. If a concurrent reuse detection revoked the family in between, the predecessor is gone — so the rotation revokes the family it just issued into and fails, instead of silently resurrecting a dead family with a fresh live row while the victim stays evicted.
+- **Reuse detection cannot be undone by a rotation already in flight.** A rotation persists its successor *before* it becomes answerable to a duplicate, and then re-reads the predecessor. If a concurrent reuse detection revoked the family in between, the predecessor is gone — so the rotation revokes the family it just issued into and fails, instead of silently resurrecting a dead family with a fresh live row while the victim stays evicted.
 - **Nothing secret is stored in the clear.** Authorization codes, refresh tokens, the pending Google state and the browser binder are persisted only as hex SHA-256 hashes. Raw values exist only in flight.
 - **Single use, everywhere.** Authorization codes, the consent nonce, pending state and refresh tokens are consumed atomically. A replayed code fails; a rotated refresh token fails. A code is burned even by a *failed* exchange.
 - **PKCE S256 is mandatory.** `plain` and a missing `code_challenge_method` are rejected. The `code_challenge` must satisfy RFC 7636 (43–128 characters of `[A-Za-z0-9-._~]`). The verifier is compared in constant time (`crypto/subtle`).
@@ -562,7 +414,7 @@ The authorization endpoint is worth the same treatment (a looser rate), since `G
 - **Redirect URI policy at registration:** absolute URL, no fragment, no userinfo, and either `https://` or `http://` on a loopback host (`127.0.0.0/8`, `::1`, `localhost`). Every other `http://` and every custom scheme is refused. `AllowedRedirectHosts` narrows the https case further — **strongly recommended for single-tenant deployments**, because with an empty allowlist anyone may register a client pointing anywhere, which is exactly what the consent page has to warn the user about.
 - **Method discipline.** The metadata documents answer `GET`/`HEAD` (and `OPTIONS` preflights) and 405 everything else. `Authorize` accepts only `GET`/`POST` — `HEAD` is refused so it can never mint state — and the Google callback is `GET`-only.
 - **Public clients only.** No `client_secret` is issued; `token_endpoint_auth_method` is `none`. PKCE plus exact redirect matching is the protection, per OAuth 2.1 for native apps.
-- **All randomness comes from `crypto/rand`** (32 bytes for codes, refresh tokens, state, the consent nonce and the binder; 24 for client ids; 16 for family ids).
+- **All randomness comes from `crypto/rand`** (32 bytes for codes, refresh tokens, state, the consent nonce and the binder; 24 for client ids; 16 for family ids). Family ids are internal revocation keys only — never accepted from a caller.
 - **No secrets in logs or errors.** The package logs nothing, and error strings never contain a token, code, upstream response body or email.
 - Token responses always carry `Cache-Control: no-store`.
 
@@ -573,7 +425,10 @@ Things this package deliberately does **not** do: scope negotiation (one fixed s
 | Symbol | Purpose |
 |---|---|
 | `New(cfg, store) (*Provider, error)` | validate config, build the provider |
-| `Provider.VerifyStore(ctx) error` | **call at startup**: round-trips canaries through the Store and reports every dropped field or broken guarantee |
+| `Provider.VerifyStore(ctx) error` | contract check for **custom** `Store` implementations: round-trips canaries and reports every dropped field or broken guarantee. Run it from your tests; `pgstore` users do not need it |
+| `pgstore.New(db, opts...) (*Store, error)` | the PostgreSQL `Store`; `pgstore.WithUserLookup(fn)` supplies the one application-owned method |
+| `pgstore.EnsureSchema(ctx, db)` / `(*Store).EnsureSchema(ctx)` | create and upgrade the four tables, idempotently |
+| `pgstore.SchemaSQL` | the DDL, for applications that own their own migrations |
 | `Provider.ProtectedResourceMetadata()` | RFC 9728 document |
 | `Provider.AuthorizationServerMetadata()` | RFC 8414 document |
 | `Provider.Register()` | RFC 7591 dynamic client registration |
@@ -597,10 +452,11 @@ The metadata and registration endpoints answer `OPTIONS` preflights and send `Ac
 ## Tests
 
 ```
-go test ./...
+go test ./...                                                   # no database needed
+MCPOAUTH_TEST_POSTGRES='postgres://...' go test -race ./...     # + the PostgreSQL contract suite
 ```
 
-Table-driven throughout. Google is mocked with `httptest`, including a JWKS document and RS256-signed ID tokens.
+Table-driven throughout. Google is mocked with `httptest`, including a JWKS document and RS256-signed ID tokens. The PostgreSQL suites skip themselves when `MCPOAUTH_TEST_POSTGRES` is unset; CI runs them against a `postgres:17` service container on every push.
 
 Functional coverage: PKCE success/failure, authorization-code single use and expiry, redirect-URI mismatch, unregistered clients, `plain` challenge rejection, refresh rotation, access-token claim validation (wrong `aud`/`iss`, expired, wrong `token_use`, `alg: none`, wrong secret), the registration redirect-URI policy, and the unknown-email 403.
 
@@ -611,8 +467,10 @@ Adversarial coverage, one suite per finding:
 - **Consent** — GET does not redirect to Google and its record is unusable on its own; approval is rejected without a nonce, with a forged nonce, with another flow's nonce, without the binder cookie and with someone else's; the nonce is single-use; hostile `client_name`/`redirect_uri` are escaped; a custom `ConsentHandler` is exercised end to end.
 - **Refresh families** — reuse revokes the family and stops the attacker's chain, revocation does not leak across families, honest rotation is unaffected; the absolute lifetime cap is enforced and does not slide.
 - **Durable reuse detection** — the replay is still caught after 6000 rotations of the stolen chain (the old bounded ledger was flushed by exactly this), after a process restart onto the same Store, after 45 days, and after all three at once; a familyless token is re-familied rather than opted out; consumed rows survive a purge until their family dies.
-- **Refresh grace window** — a duplicate submission gets the same refresh token back and keeps its session; 32 concurrent grants leave exactly one usable token and it still works; a two-step-stale token or a replay past the window revokes the family; the window is anchored to the first `consumed_at` and does not roll; the sealed successor is not recoverable from the stored row.
-- **Store fault injection** — the highest-value suite, because it is how an insecure deployment actually happens. A compliant Store is wrapped and exactly ONE rule is broken per case: dropping `BinderHash`, `Approved`, `FamilyID`, `FamilyCreatedAt`, `FamilyExpiresAt` or `SuccessorSealed`; deleting on consume; never stamping `ConsumedAt`; returning the post-update row; **overwriting** `ConsumedAt` (the missing `AND consumed_at IS NULL`); filtering expired rows out of the consume; `LinkRefreshSuccessor` written as an upsert; `SavePendingAuth` upserting on `client_id` and losing a record; a replayable auth code; a no-op `RevokeRefreshTokenFamily`; a purge that forgets clients. Every one is caught with a message naming the fault — and a compliant Store passes, twice, leaving nothing behind and disturbing no real rows.
+- **Refresh grace window** — a duplicate submission gets the same refresh token back and keeps its session; 32 concurrent grants leave exactly one usable token and it still works; a two-step-stale token or a replay past the window revokes the family; the window is anchored to the first `consumed_at` and does not roll; neither raw token is recoverable from anything the Store holds; a duplicate the process cannot answer (a restart mid-window) is retried rather than treated as reuse, and detection resumes unchanged the moment the window closes; the grace cache expires, stays under its cap, and holds nothing at all when the window is disabled.
+- **Store fault injection** — the highest-value suite, because it is how an insecure deployment actually happens. A compliant Store is wrapped and exactly ONE rule is broken per case: dropping `BinderHash`, `Approved`, `FamilyID`, `FamilyCreatedAt` or `FamilyExpiresAt`; deleting on consume; never stamping `ConsumedAt`; returning the post-update row; **overwriting** `ConsumedAt` (the missing `AND consumed_at IS NULL`); filtering expired rows out of the consume; a `GetRefreshToken` that hides consumed rows; `SavePendingAuth` upserting on `client_id` and losing a record; a replayable auth code; a no-op `RevokeRefreshTokenFamily`; a purge that forgets clients. Every one is caught with a message naming the fault — and a compliant Store passes, twice, leaving nothing behind and disturbing no real rows.
+- **The PostgreSQL contract suite** (`MCPOAUTH_TEST_POSTGRES`) — the same rules, on the medium that ships. `pgstore` is put through `VerifyStore` and through direct assertions of each load-bearing invariant: the `ConsumeRefreshToken` CTE under 16 concurrent callers (exactly one sees a zero `ConsumedAt`) and under replay (the ORIGINAL stamp comes back, and is never re-written); the unfiltered `GetRefreshToken`; single-use authorization codes and pending state, including 8 goroutines racing one code; `PurgeExpired` retaining a row until BOTH its own and its family's expiry; and the token endpoint driven end to end over real SQL. Then ten pieces of plausible-but-wrong **real SQL** — the missing `AND consumed_at IS NULL`, `UPDATE ... RETURNING`, `DELETE ... RETURNING`, an expiry filter, a `SELECT`-then-`UPDATE` with no `FOR UPDATE`, a filtered `GetRefreshToken`, a purge missing half its condition or a whole table, a `client_id`-keyed pending upsert, a read-only auth-code consume — each of which `VerifyStore` has to name.
+- **Schema adoption** — `pgstore.EnsureSchema` builds the schema from nothing, is idempotent, survives 8 instances booting at once, and adopts a database created by the consumers' own hand-written migrations: it drops the retired `successor_sealed` column, and a refresh token issued by v1 keeps rotating in the same family across the upgrade, with reuse detection intact. Nobody is logged out by the deploy.
 - **`VerifyStore` canaries** — 40 verifications run against a hot `PurgeExpired` ticker with no false positive, four concurrent verifications (a rolling deploy) all pass, `Config.VerifyStoreUserID` reaches every canary row, and the canary `client_id` stays within the 48 characters the README promises.
 - **Refresh rotation races** — a duplicate whose clock runs *behind* the winner's is absorbed rather than revoking the family (the bug behind this suite's own historic flake); 10 × 32 concurrent refreshes of one token always leave exactly one usable chain and never revoke; a reuse detection that fires mid-rotation is not undone by the in-flight `SaveRefreshToken`; a rotation whose persist failed lets the client retry instead of killing its session; a wrong `client_id` neither consumes the token nor revokes the family, while the owner's own replay still does.
 - **Lifecycle** — `InsecureDevMode` is rejected unless *every* configured URL is loopback http (each URL poisoned in turn); unused client registrations are purged and used ones are not; two authorization flows in one browser both complete, while an evicted, foreign, oversized or malformed binder is refused and never echoed back in `Set-Cookie`.
