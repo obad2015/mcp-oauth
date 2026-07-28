@@ -5,9 +5,16 @@ import (
 	"time"
 )
 
-// Store is the persistence contract an application implements to back the
-// authorization server. It is deliberately driver-agnostic: any SQL, KV or
-// in-memory backend works.
+// Store is the persistence contract behind the authorization server. It is
+// deliberately driver-agnostic: any SQL, KV or in-memory backend works.
+//
+// MOST APPLICATIONS SHOULD NOT IMPLEMENT THIS. The library ships pgstore, a
+// PostgreSQL implementation that is verified against a real server by the
+// library's own CI, and leaves exactly one method to the application
+// (FindUserIDByEmail, via pgstore.WithUserLookup) because only the application
+// knows its users table. This interface stays public for exotic backends; if
+// you are writing one, read STORE-CONTRACT.md and run Provider.VerifyStore
+// against it in your tests.
 //
 // Implementation requirements:
 //
@@ -29,10 +36,11 @@ import (
 //     pending state and the browser binder are always identified by their
 //     SHA-256 hash (hex).
 //   - Every field of every struct MUST round-trip. Dropping FamilyID,
-//     FamilyCreatedAt, FamilyExpiresAt, ConsumedAt, SuccessorSealed or
-//     BinderHash silently disables a security control. Call
-//     Provider.VerifyStore once at startup — it round-trips canary records and
-//     fails loudly if anything is lost.
+//     FamilyCreatedAt, FamilyExpiresAt, ConsumedAt or BinderHash silently
+//     disables a security control. Run Provider.VerifyStore against this Store
+//     in your own test suite — it round-trips canary records and fails loudly
+//     if anything is lost. (Applications on the library's own pgstore do not
+//     need it: the library's CI already runs it against real PostgreSQL.)
 //
 // Retention rule (important): a refresh-token row is the durable
 // reuse-detection ledger. It must be kept until BOTH its own ExpiresAt and its
@@ -64,7 +72,7 @@ type Store interface {
 	ConsumePendingAuth(ctx context.Context, stateHash string) (PendingAuth, bool, error)
 
 	// SaveRefreshToken persists a refresh token record (hash only). The row
-	// is written with a zero ConsumedAt and no SuccessorSealed.
+	// is written with a zero ConsumedAt.
 	SaveRefreshToken(ctx context.Context, rt RefreshToken) error
 
 	// GetRefreshToken reads a refresh-token row without modifying it.
@@ -76,12 +84,11 @@ type Store interface {
 	//	SELECT * FROM mcp_oauth_refresh_tokens WHERE token_hash = $1;
 	//
 	// The Provider calls this on an already-consumed row in two places: the
-	// client_id pre-check before a rotation, and the post-Link re-read that
-	// confirms the row it just wrote onto still exists. Add `AND consumed_at IS
-	// NULL` by symmetry with ConsumeRefreshToken and both break: the pre-check
-	// treats every refresh as an unknown token, and the post-Link re-read never
-	// finds the just-consumed predecessor, so every rotation revokes its own
-	// family.
+	// client_id pre-check before a rotation, and the post-rotation re-read that
+	// confirms the predecessor still exists. Add `AND consumed_at IS NULL` by
+	// symmetry with ConsumeRefreshToken and both break: the pre-check treats
+	// every refresh as an unknown token, and the re-read never finds the
+	// just-consumed predecessor, so every rotation revokes its own family.
 	GetRefreshToken(ctx context.Context, tokenHash string) (RefreshToken, bool, error)
 
 	// ConsumeRefreshToken atomically stamps ConsumedAt on a refresh-token row
@@ -131,24 +138,6 @@ type Store interface {
 	// that returns ZERO rows on a replay, which the Provider reads as "unknown
 	// token" — plain invalid_grant, no family revocation, silently.
 	ConsumeRefreshToken(ctx context.Context, tokenHash string, consumedAt time.Time) (RefreshToken, bool, error)
-
-	// LinkRefreshSuccessor records, on an already-consumed row, the sealed
-	// successor token that rotation produced, and (re)stamps the row's
-	// FamilyID.
-	//
-	// sealed is an opaque encrypted blob: store and return it verbatim, never
-	// interpret it. It lets a duplicate submission inside
-	// Config.RefreshGracePeriod be answered with the very same refresh token
-	// instead of destroying the client's session — see the README.
-	//
-	// familyID is the family the successor belongs to. It is normally the row's
-	// own family; for a legacy row whose FamilyID was empty this adopts the row
-	// into the new family, so a later replay can still revoke it.
-	//
-	// It MUST be a no-op returning nil when the hash is unknown, and it must
-	// NEVER be an UPSERT: an INSERT path here materialises a refresh-token row
-	// that was never issued, with a caller-influenced family_id.
-	LinkRefreshSuccessor(ctx context.Context, tokenHash, familyID string, sealed []byte) error
 
 	// RevokeRefreshTokensForUser invalidates every refresh token of a user.
 	// Deleting the rows is fine here.

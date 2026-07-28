@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -314,7 +315,13 @@ func TestRefreshGracePeriod(t *testing.T) {
 		}
 	})
 
-	t.Run("the sealed successor is not readable without the predecessor token", func(t *testing.T) {
+	t.Run("the successor never reaches the Store in any form", func(t *testing.T) {
+		// v1 sealed the successor onto the consumed predecessor row with
+		// AES-GCM so that a database dump stayed worthless. v2 keeps the
+		// predecessor -> successor link in process instead, which makes the
+		// same guarantee unconditional: there is nothing to decrypt because
+		// there is nothing stored. What the Store still holds — and must —
+		// is the ConsumedAt stamp that reuse detection is judged against.
 		h := newHarness(t)
 		clientID, pair := firstPair(t, h)
 		issued := decodeJSON[tokenSuccess](t, rotate(h, clientID, pair.RefreshToken))
@@ -323,14 +330,60 @@ func TestRefreshGracePeriod(t *testing.T) {
 		if err != nil || !ok {
 			t.Fatalf("the consumed row is gone: ok=%v err=%v", ok, err)
 		}
-		if len(row.SuccessorSealed) == 0 {
-			t.Fatal("no sealed successor was attached to the consumed row")
+		if row.ConsumedAt.IsZero() {
+			t.Fatal("the predecessor row lost its ConsumedAt stamp: reuse detection is disabled")
 		}
-		// Everything the database holds, and the successor is not in it.
-		for _, field := range []string{row.TokenHash, row.FamilyID, string(row.SuccessorSealed)} {
-			if field == issued.RefreshToken {
-				t.Fatal("the successor token is recoverable from the stored row")
+		// Everything the database holds about either row, and neither raw
+		// token is in any of it.
+		successorRow, ok, err := h.store.GetRefreshToken(context.Background(), mcpoauth.HashSecret(issued.RefreshToken))
+		if err != nil || !ok {
+			t.Fatalf("the successor row is missing: ok=%v err=%v", ok, err)
+		}
+		for _, field := range []string{
+			row.TokenHash, row.FamilyID, row.ClientID, row.UserID,
+			successorRow.TokenHash, successorRow.FamilyID,
+		} {
+			if field == issued.RefreshToken || field == pair.RefreshToken {
+				t.Fatalf("a raw refresh token is recoverable from the stored rows: %q", field)
 			}
+		}
+	})
+
+	t.Run("a duplicate that this process cannot answer never revokes", func(t *testing.T) {
+		// The grace link is in process, so a restart (or another instance)
+		// loses it. That must fail SAFE in the liveness direction too: the
+		// duplicate is reported as an in-flight rotation and retried, never
+		// treated as reuse — reading an absence as evidence is exactly the
+		// round-3 HIGH where pure concurrency collapsed a family.
+		h := newHarness(t)
+		clientID, pair := firstPair(t, h)
+		first := decodeJSON[tokenSuccess](t, rotate(h, clientID, pair.RefreshToken))
+
+		h.advance(5 * time.Second) // still inside the 30s window
+		h.restart()                // same Store, brand new Provider: grace cache gone
+
+		rec := rotate(h, clientID, pair.RefreshToken)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		if desc := decodeJSON[errorBody](t, rec).Description; strings.Contains(desc, "revoked") {
+			t.Fatalf("a duplicate the restarted process could not answer revoked the family: %q", desc)
+		}
+		if rec := rotate(h, clientID, first.RefreshToken); rec.Code != http.StatusOK {
+			t.Fatalf("the client's live token died with a duplicate it never sent: %d %s",
+				rec.Code, rec.Body.String())
+		}
+
+		// ...and once the window closes, detection is exactly as strict as ever.
+		pastGrace(h)
+		if rec := rotate(h, clientID, pair.RefreshToken); rec.Code != http.StatusBadRequest {
+			t.Fatalf("late replay: status = %d, want 400", rec.Code)
+		}
+		if desc := decodeJSON[errorBody](t, rotate(h, clientID, first.RefreshToken)).Description; desc == "" {
+			t.Fatal("the family survived reuse detection after the grace window closed")
+		}
+		if live := h.store.LiveRefresh(); live != 0 {
+			t.Fatalf("%d usable refresh tokens survived the family revocation", live)
 		}
 	})
 }

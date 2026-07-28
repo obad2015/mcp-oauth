@@ -20,3 +20,19 @@ const MaxStaleJWKSForTest = maxStaleJWKS
 // SetNowForTest overrides the provider's clock so expiry behaviour can be
 // exercised without sleeping.
 func (p *Provider) SetNowForTest(f func() time.Time) { p.now = f }
+
+// GraceLenForTest reports how many rotations the in-process grace cache is
+// currently holding.
+func (p *Provider) GraceLenForTest() int {
+	p.graceMu.Lock()
+	defer p.graceMu.Unlock()
+	return len(p.grace)
+}
+
+// MaxGraceEntriesForTest is the cap on the grace cache.
+const MaxGraceEntriesForTest = maxGraceEntries
+
+// RecallForTest exposes the grace-cache lookup.
+func (p *Provider) RecallForTest(predecessorHash string) (string, bool) {
+	return p.recallSuccessor(predecessorHash, p.now())
+}

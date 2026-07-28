@@ -39,6 +39,13 @@ type Provider struct {
 	mu sync.Mutex
 	// lastPurge throttles the opportunistic PurgeExpired call.
 	lastPurge time.Time
+
+	graceMu sync.Mutex
+	// grace maps a just-rotated refresh token's hash to the successor it was
+	// exchanged for, for the length of Config.RefreshGracePeriod. See grace.go
+	// for why this one piece of state is allowed to be in-process while the
+	// reuse ledger is not.
+	grace map[string]graceEntry
 }
 
 // New validates cfg and returns a Provider.
@@ -189,6 +196,7 @@ func New(cfg Config, store Store) (*Provider, error) {
 		http:    httpClient,
 		signKey: deriveSigningKey(cfg.JWTSecret),
 		now:     time.Now,
+		grace:   make(map[string]graceEntry, 16),
 	}
 	p.jwks = newJWKSCache(cfg.GoogleJWKSURL, httpClient, p.nowFn)
 	return p, nil

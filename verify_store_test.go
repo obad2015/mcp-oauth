@@ -45,7 +45,6 @@ type faultStore struct {
 	dropFamilyID                bool
 	dropFamilyCreatedAt         bool
 	dropFamilyExpiresAt         bool
-	dropSealed                  bool
 	deleteOnConsume             bool
 	neverStampConsumed          bool
 	returnRowAfterStamp         bool
@@ -53,7 +52,6 @@ type faultStore struct {
 	filterExpiredRows           bool
 	getFiltersConsumed          bool
 	nonAtomicConsume            bool
-	linkIsUpsert                bool
 	pendingIsUpsert             bool
 	replayableAuthCode          bool
 	revokeIsNoOp                bool
@@ -208,24 +206,6 @@ func (f *faultStore) ConsumeRefreshToken(ctx context.Context, hash string, at ti
 		return before, true, nil
 	}
 	return f.Store.ConsumeRefreshToken(ctx, hash, at)
-}
-
-func (f *faultStore) LinkRefreshSuccessor(ctx context.Context, hash, familyID string, sealed []byte) error {
-	if f.dropSealed {
-		sealed = nil
-	}
-	if f.linkIsUpsert {
-		if _, ok, err := f.Store.GetRefreshToken(ctx, hash); err == nil && !ok {
-			// INSERT ... ON CONFLICT DO UPDATE: a row is conjured for a token
-			// that was never issued.
-			return f.Store.SaveRefreshToken(ctx, mcpoauth.RefreshToken{
-				TokenHash:       hash,
-				FamilyID:        familyID,
-				SuccessorSealed: sealed,
-			})
-		}
-	}
-	return f.Store.LinkRefreshSuccessor(ctx, hash, familyID, sealed)
 }
 
 func (f *faultStore) RevokeRefreshTokenFamily(ctx context.Context, familyID string) error {
@@ -417,11 +397,6 @@ func TestVerifyStore(t *testing.T) {
 			wantMsg: "FamilyExpiresAt",
 		},
 		{
-			name:    "drops RefreshToken.SuccessorSealed",
-			broken:  func(f *faultStore) { f.dropSealed = true },
-			wantMsg: "SuccessorSealed",
-		},
-		{
 			name:    "deletes the row on consume instead of stamping it",
 			broken:  func(f *faultStore) { f.deleteOnConsume = true },
 			wantMsg: "reuse can never be detected",
@@ -457,11 +432,6 @@ func TestVerifyStore(t *testing.T) {
 			name:    "GetRefreshToken filters out consumed rows",
 			broken:  func(f *faultStore) { f.getFiltersConsumed = true },
 			wantMsg: "GetRefreshToken stopped returning the row",
-		},
-		{
-			name:    "LinkRefreshSuccessor is an upsert",
-			broken:  func(f *faultStore) { f.linkIsUpsert = true },
-			wantMsg: "never an UPSERT",
 		},
 		{
 			name:    "SavePendingAuth upserts on client_id and loses a record",
