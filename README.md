@@ -121,6 +121,10 @@ Your handler must not redirect to Google itself — posting the nonce back is wh
 
 ## Mounting it
 
+`Provider.Routes()` computes the whole route table — every OAuth endpoint plus the RFC 8414 / RFC 9728 discovery documents, including the path-inserted protected-resource variant — straight from `Config`. That is the one thing worth not hand-rolling: personal-finance once hand-derived that path-inserted route against the wrong URL and shipped a 404 for every spec-compliant MCP client. `Routes()` is unit-tested against exactly that shape of config so it can't happen again.
+
+`mcpoauth.Mount` (below) and the two framework adapters just walk `Routes()`; use whichever matches your router.
+
 ### net/http
 
 ```go
@@ -186,18 +190,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Discovery. These must be reachable at the URLs above (see "Reverse
-	// proxies" below if your API is mounted under a prefix).
-	mux.HandleFunc("/.well-known/oauth-protected-resource", provider.ProtectedResourceMetadata())
-	mux.HandleFunc("/.well-known/oauth-protected-resource/", provider.ProtectedResourceMetadata())
-	mux.HandleFunc("/.well-known/oauth-authorization-server", provider.AuthorizationServerMetadata())
-	mux.HandleFunc("/.well-known/openid-configuration", provider.AuthorizationServerMetadata())
-
-	// The OAuth endpoints.
-	mux.HandleFunc("/mcp/oauth/register", provider.Register())
-	mux.HandleFunc("/mcp/oauth/authorize", provider.Authorize())
-	mux.HandleFunc("/mcp/oauth/token", provider.Token())
-	mux.HandleFunc("/mcp/oauth/google/callback", provider.GoogleCallback())
+	// Every OAuth endpoint plus the discovery documents, derived from
+	// Config above — see Provider.Routes() if you need the list itself
+	// (e.g. to log it, or to rewrite Path for a proxy that strips a prefix).
+	mcpoauth.Mount(mux, provider)
 
 	// The protected MCP endpoint.
 	mux.Handle("/mcp", provider.Middleware(myMCPHandler()))
@@ -214,16 +210,13 @@ userID, ok := mcpoauth.UserIDFromContext(r.Context())
 
 ### Echo
 
-Wrap the `http.HandlerFunc`s with `echo.WrapHandler`:
-
 ```go
-e.Any("/.well-known/oauth-protected-resource", echo.WrapHandler(provider.ProtectedResourceMetadata()))
-e.Any("/.well-known/oauth-authorization-server", echo.WrapHandler(provider.AuthorizationServerMetadata()))
-e.Any("/mcp/oauth/register", echo.WrapHandler(provider.Register()))
-e.Any("/mcp/oauth/authorize", echo.WrapHandler(provider.Authorize()))
-e.Any("/mcp/oauth/token", echo.WrapHandler(provider.Token()))
-e.Any("/mcp/oauth/google/callback", echo.WrapHandler(provider.GoogleCallback()))
+import "github.com/obad2015/mcp-oauth/mount/echomount"
+
+echomount.Mount(e, provider)
 ```
+
+`mount/echomount` is a separate Go module (its own `go.mod`) so the core `mcp-oauth` module never depends on Echo — `go get github.com/obad2015/mcp-oauth` alone never pulls it in. Add it only if you use it: `go get github.com/obad2015/mcp-oauth/mount/echomount`.
 
 Use `echo.WrapMiddleware(provider.Middleware)` to protect the MCP route, or — more commonly — keep your existing auth middleware and chain the validators:
 
@@ -256,6 +249,16 @@ func mcpAuth(p *mcpoauth.Provider, tokens TokenStore) echo.MiddlewareFunc {
 
 `Unauthorized` emits exactly the 401 + `WWW-Authenticate: Bearer resource_metadata="…"` that makes an MCP client start the OAuth flow, so both paths stay consistent.
 
+### Gin
+
+```go
+import "github.com/obad2015/mcp-oauth/mount/ginmount"
+
+ginmount.Mount(r, provider) // r is a *gin.Engine or any gin.IRouter
+```
+
+Also its own module (`go get github.com/obad2015/mcp-oauth/mount/ginmount`) — opt in only if you use Gin.
+
 ### Reverse proxies
 
 The discovery documents are fetched by the client at the **issuer host root**: `https://host/.well-known/oauth-protected-resource` and `https://host/.well-known/oauth-authorization-server`. If your Go API only receives traffic under `/api/`, add the two well-known paths to the proxy:
@@ -268,6 +271,18 @@ location ^~ /.well-known/oauth- {
 ```
 
 `MetadataBaseURL` only affects the URL advertised in the `WWW-Authenticate` challenge — set it to whatever base actually serves the documents (it defaults to `Issuer`).
+
+`Routes()` (and therefore `Mount`/`echomount.Mount`/`ginmount.Mount`) registers every path exactly as it appears in the configured public URLs — correct as long as your proxy preserves the path, which is how both of this package's production deployments are set up. If yours instead strips a prefix before the request reaches Go, rewrite `Path` on the routes before registering them:
+
+```go
+routes := provider.Routes()
+for i := range routes {
+	routes[i].Path = strings.TrimPrefix(routes[i].Path, "/api")
+}
+for _, route := range routes {
+	mux.Handle(route.Path, route.Handler)
+}
+```
 
 ## Persistence
 
@@ -429,6 +444,10 @@ Things this package deliberately does **not** do: scope negotiation (one fixed s
 | `pgstore.New(db, opts...) (*Store, error)` | the PostgreSQL `Store`; `pgstore.WithUserLookup(fn)` supplies the one application-owned method |
 | `pgstore.EnsureSchema(ctx, db)` / `(*Store).EnsureSchema(ctx)` | create and upgrade the four tables, idempotently |
 | `pgstore.SchemaSQL` | the DDL, for applications that own their own migrations |
+| `Provider.Routes() []Route` | the whole route table (path, methods, handler), derived from `Config` — see [Mounting it](#mounting-it) |
+| `Mount(mux, provider)` | register every `Route` on a `*http.ServeMux` |
+| `echomount.Mount(e, provider)` | same, for Echo — `github.com/obad2015/mcp-oauth/mount/echomount`, its own module |
+| `ginmount.Mount(r, provider)` | same, for Gin — `github.com/obad2015/mcp-oauth/mount/ginmount`, its own module |
 | `Provider.ProtectedResourceMetadata()` | RFC 9728 document |
 | `Provider.AuthorizationServerMetadata()` | RFC 8414 document |
 | `Provider.Register()` | RFC 7591 dynamic client registration |
