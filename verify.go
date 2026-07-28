@@ -1,7 +1,6 @@
 package mcpoauth
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -21,12 +20,22 @@ const defaultVerifyStoreUserID = "mcpoauth-verify-user"
 // VerifyStore round-trips canary records through the Store and reports, in one
 // error, every field or behaviour that did not survive.
 //
-// Call it once at startup, before serving traffic, and treat a failure as
-// fatal:
+// It is a TEST TOOL for authors of custom Stores, not a startup ritual.
+// Applications on the library's own pgstore do not need it: pgstore is verified
+// by this repository's CI against a real PostgreSQL server on every push, and
+// its startup step is EnsureSchema plus a connectivity ping. If you have
+// written your own Store, run this from your test suite:
 //
-//	provider, err := mcpoauth.New(cfg, store)
-//	if err != nil { log.Fatal(err) }
-//	if err := provider.VerifyStore(ctx); err != nil { log.Fatal(err) }
+//	func TestMyStoreIsCompliant(t *testing.T) {
+//		p, err := mcpoauth.New(cfg, myStore)
+//		if err != nil { t.Fatal(err) }
+//		if err := p.VerifyStore(context.Background()); err != nil { t.Fatal(err) }
+//	}
+//
+// It is safe to call at startup too — it writes only its own canaries and
+// cleans them up — but a Store whose compliance is decided by code that never
+// changes between deploys is better checked where a failure costs a red build
+// instead of an outage.
 //
 // A Store that silently drops a column is the most likely way to deploy this
 // package insecurely: losing BinderHash disables the browser binding that stops
@@ -279,7 +288,6 @@ func (v *storeVerifier) checkRefreshToken() {
 	hash := v.canary("refresh")
 	v.canaryRefreshHash = hash
 	familyID := "mcpoauth-verify-family-" + v.canary("family")[:16]
-	adopted := "mcpoauth-verify-family2-" + v.canary("family2")[:16]
 	want := RefreshToken{
 		TokenHash:       hash,
 		ClientID:        v.canaryClientID,
@@ -322,19 +330,10 @@ func (v *storeVerifier) checkRefreshToken() {
 		v.failf("RefreshToken.ConsumedAt: a freshly saved token came back consumed (%v)", got.ConsumedAt)
 	}
 
-	// LinkRefreshSuccessor on a hash nobody issued must be a plain no-op. An
-	// integrator who writes it as an UPSERT materialises a refresh-token row
-	// that was never issued — and, with an attacker-chosen family_id, one that
-	// is immediately usable as a rotation anchor.
-	unknown := v.canary("never-issued")
-	if err := v.p.store.LinkRefreshSuccessor(v.ctx, unknown, familyID, []byte("x")); err != nil {
-		v.failf("LinkRefreshSuccessor returned an error for an unknown hash (it must be a "+
-			"no-op returning nil): %v", err)
-	}
-	if _, created, err := v.p.store.GetRefreshToken(v.ctx, unknown); err == nil && created {
-		v.failf("LinkRefreshSuccessor created a refresh-token row from an unknown hash: it " +
-			"must be a plain UPDATE ... WHERE token_hash = $1, never an UPSERT — an INSERT " +
-			"path here mints a token row that was never issued")
+	// An unknown hash is an absence, not an error.
+	if _, created, err := v.p.store.GetRefreshToken(v.ctx, v.canary("never-issued")); err != nil || created {
+		v.failf("GetRefreshToken on a hash that was never issued: ok=%v err=%v "+
+			"(it must report ok=false with a nil error)", created, err)
 	}
 
 	// The canary is right now in exactly the state PurgeExpired must retain: its
@@ -381,11 +380,6 @@ func (v *storeVerifier) checkRefreshToken() {
 	}
 	v.eq("ConsumeRefreshToken FamilyID", first.FamilyID, want.FamilyID)
 
-	sealed := []byte("mcpoauth-verify-sealed-successor-blob")
-	if err := v.p.store.LinkRefreshSuccessor(v.ctx, hash, adopted, sealed); err != nil {
-		v.failf("LinkRefreshSuccessor failed: %v", err)
-	}
-
 	// Second consume: this is the reuse signal. The row MUST still exist.
 	second, ok, err := v.p.store.ConsumeRefreshToken(v.ctx, hash, v.now.Add(time.Hour))
 	if err != nil {
@@ -404,12 +398,7 @@ func (v *storeVerifier) checkRefreshToken() {
 	} else {
 		v.eqTime("RefreshToken.ConsumedAt", second.ConsumedAt, consumedAt)
 	}
-	if !bytes.Equal(second.SuccessorSealed, sealed) {
-		v.failf("LinkRefreshSuccessor did not persist SuccessorSealed (got %d bytes, want %d): "+
-			"a duplicate refresh submission will log the client out instead of replaying",
-			len(second.SuccessorSealed), len(sealed))
-	}
-	v.eq("LinkRefreshSuccessor did not re-stamp FamilyID", second.FamilyID, adopted)
+	v.eq("ConsumeRefreshToken lost FamilyID on the replay", second.FamilyID, want.FamilyID)
 
 	// Third consume, two hours after the stamp the row should still be carrying.
 	// A Store that omits `AND consumed_at IS NULL` from the UPDATE re-stamps on
@@ -455,7 +444,7 @@ func (v *storeVerifier) checkRefreshToken() {
 			"revokes its own family")
 	}
 
-	if err := v.p.store.RevokeRefreshTokenFamily(v.ctx, adopted); err != nil {
+	if err := v.p.store.RevokeRefreshTokenFamily(v.ctx, familyID); err != nil {
 		v.failf("RevokeRefreshTokenFamily failed: %v", err)
 		return
 	}

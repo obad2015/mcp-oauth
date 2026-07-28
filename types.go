@@ -138,8 +138,7 @@ type Config struct {
 	TokenURL     string
 	RegisterURL  string
 
-	// JWTSecret is the input keying material for the access-token signing
-	// key and for the refresh-successor sealing key.
+	// JWTSecret is the input keying material for the access-token signing key.
 	//
 	// It must be at least 32 bytes AND contain at least 8 distinct byte
 	// values; New rejects anything else. Those are crude sanity checks, not a
@@ -174,6 +173,13 @@ type Config struct {
 	// (dropped connection, a retry, two parallel requests) would otherwise
 	// destroy its own session: its retry looks exactly like a replay and
 	// revokes the family.
+	//
+	// The predecessor -> successor mapping the answer needs is held IN PROCESS
+	// (see grace.go), so a duplicate that arrives after a restart, or on
+	// another instance, cannot be answered: it costs one re-login and nothing
+	// else. The reuse ledger it is judged against — RefreshToken.ConsumedAt —
+	// is durable in the Store and is what bounds this window; losing a grace
+	// entry can never widen it.
 	//
 	// The trade-off is explicit: for this window a leaked refresh token that is
 	// replayed does NOT trigger family revocation, it simply hands the replayer
@@ -338,9 +344,4 @@ type RefreshToken struct {
 	// been used. Set only by Store.ConsumeRefreshToken, and never overwritten
 	// once set.
 	ConsumedAt time.Time
-	// SuccessorSealed is the encrypted successor token attached by
-	// Store.LinkRefreshSuccessor. It is opaque to the Store: persist the bytes
-	// and give them back unchanged. Only a caller who presents the raw
-	// predecessor token can decrypt it, so a database leak reveals nothing.
-	SuccessorSealed []byte
 }

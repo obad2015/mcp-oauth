@@ -66,6 +66,16 @@ func postgresDSN(t *testing.T) string {
 // on whole tables.
 func openPostgres(t *testing.T) *sql.DB {
 	t.Helper()
+	db := openPostgresRaw(t)
+	ensureTestSchema(t, db)
+	truncateAll(t, db)
+	return db
+}
+
+// openPostgresRaw connects without creating or clearing anything, for the tests
+// that own the schema themselves.
+func openPostgresRaw(t *testing.T) *sql.DB {
+	t.Helper()
 	dsn := postgresDSN(t)
 
 	db, err := sql.Open("postgres", dsn)
@@ -80,10 +90,19 @@ func openPostgres(t *testing.T) *sql.DB {
 	// statements at the same row and each one holds a FOR UPDATE lock.
 	db.SetMaxOpenConns(maxTestConns)
 	warmPool(t, db)
-
-	ensureTestSchema(t, db)
-	truncateAll(t, db)
 	return db
+}
+
+// dropAll removes every table this package owns, so a test can rebuild the
+// schema from an arbitrary starting point.
+func dropAll(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(context.Background(), `
+		DROP TABLE IF EXISTS mcp_oauth_clients, mcp_oauth_auth_codes,
+		    mcp_oauth_pending_auth, mcp_oauth_refresh_tokens, mcp_oauth_schema_version`)
+	if err != nil {
+		t.Fatalf("dropping the oauth tables: %v", err)
+	}
 }
 
 // maxTestConns bounds the pool. The atomicity checks fire 8-16 statements at

@@ -698,15 +698,7 @@ func (p *Provider) authorizationCodeGrant(w http.ResponseWriter, r *http.Request
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not start a token family")
 		return
 	}
-	p.issueTokenPair(r.Context(), w, rotation{}, ac.ClientID, ac.UserID, familyID, p.now())
-}
-
-// rotation identifies the refresh token a new pair is descended from, so the
-// predecessor's row can be linked to its successor. The zero value means "this
-// is a fresh login, there is no predecessor".
-type rotation struct {
-	raw  string
-	hash string
+	p.issueTokenPair(r.Context(), w, "", ac.ClientID, ac.UserID, familyID, p.now())
 }
 
 // refreshTokenGrant rotates a refresh token.
@@ -758,7 +750,7 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !rt.ConsumedAt.IsZero() {
-		p.replayedRefreshToken(w, r, rt, raw, clientID, now)
+		p.replayedRefreshToken(w, r, rt, tokenHash, clientID, now)
 		return
 	}
 
@@ -773,8 +765,8 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 		familyStart = rt.CreatedAt
 	}
 	if familyStart.IsZero() || !now.Before(familyStart.Add(p.cfg.RefreshTokenAbsoluteTTL)) {
-		if rt.FamilyID != "" {
-			if err := p.store.RevokeRefreshTokenFamily(r.Context(), rt.FamilyID); err != nil {
+		if familyID := familyToRevoke(rt, tokenHash); familyID != "" {
+			if err := p.store.RevokeRefreshTokenFamily(r.Context(), familyID); err != nil {
 				writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not revoke the token family")
 				return
 			}
@@ -790,18 +782,16 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 
 	// Fail closed on a token with no family: rather than propagate the
 	// emptiness (which would opt the whole chain out of reuse detection and the
-	// absolute cap), start a family here. LinkRefreshSuccessor stamps it back
-	// onto this row so a later replay of it still revokes the new family.
+	// absolute cap), start a family here. It is DERIVED from this row's hash,
+	// not random, because nothing writes it back onto this row — a replay of
+	// this same familyless token recomputes it and still kills the chain it
+	// spawned. See legacyFamilyID.
 	familyID := rt.FamilyID
 	if familyID == "" {
-		if familyID, err = randomToken(16); err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not start a token family")
-			return
-		}
+		familyID = legacyFamilyID(tokenHash)
 	}
 
-	p.issueTokenPair(r.Context(), w, rotation{raw: raw, hash: tokenHash},
-		rt.ClientID, rt.UserID, familyID, familyStart)
+	p.issueTokenPair(r.Context(), w, tokenHash, rt.ClientID, rt.UserID, familyID, familyStart)
 }
 
 // replayedRefreshToken handles a token that was already rotated away.
@@ -815,23 +805,24 @@ func (p *Provider) refreshTokenGrant(w http.ResponseWriter, r *http.Request) {
 // Everything else is refresh-token REUSE: either the legitimate client or a
 // thief is replaying a spent token and we cannot tell which, so the whole
 // family dies and both holders have to sign in again.
-func (p *Provider) replayedRefreshToken(w http.ResponseWriter, r *http.Request, rt RefreshToken, raw, clientID string, now time.Time) {
-	if p.graceApplies(r.Context(), rt, raw, clientID, now) {
-		successor, ok := p.openSuccessor(raw, rt.SuccessorSealed)
-		if ok {
+func (p *Provider) replayedRefreshToken(w http.ResponseWriter, r *http.Request, rt RefreshToken, tokenHash, clientID string, now time.Time) {
+	if successor, inGrace := p.graceApplies(r.Context(), rt, tokenHash, clientID, now); inGrace {
+		if successor != "" {
 			p.writeTokenPair(w, rt.UserID, successor, now)
 			return
 		}
-		// The winning rotation has not attached its successor yet (a genuinely
-		// concurrent duplicate). Fail this attempt, but never revoke: the
-		// caller retries and the family stays alive.
+		// The window applies but this process cannot answer: the winning
+		// rotation has not finished yet (a genuinely concurrent duplicate), or
+		// the grace entry is not here at all (restart, another instance). Fail
+		// this attempt, but never revoke — the caller retries, and once the
+		// window closes the replay is judged as reuse like any other.
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant",
 			"this refresh token is being rotated by another request; retry")
 		return
 	}
 
-	if rt.FamilyID != "" {
-		if err := p.store.RevokeRefreshTokenFamily(r.Context(), rt.FamilyID); err != nil {
+	if familyID := familyToRevoke(rt, tokenHash); familyID != "" {
+		if err := p.store.RevokeRefreshTokenFamily(r.Context(), familyID); err != nil {
 			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not revoke the token family")
 			return
 		}
@@ -841,10 +832,16 @@ func (p *Provider) replayedRefreshToken(w http.ResponseWriter, r *http.Request, 
 }
 
 // graceApplies reports whether a replayed token qualifies for the idempotent
-// grace window. Every condition is deliberately narrow.
-func (p *Provider) graceApplies(ctx context.Context, rt RefreshToken, raw, clientID string, now time.Time) bool {
+// grace window, and with which successor. Every condition is deliberately
+// narrow.
+//
+// An empty successor with ok=true means "the window applies but this process
+// cannot answer the duplicate". That is never treated as evidence of anything:
+// the absence of a grace entry is an absence, and reading it as reuse would
+// bring back the round-3 HIGH where pure concurrency collapsed a family.
+func (p *Provider) graceApplies(ctx context.Context, rt RefreshToken, tokenHash, clientID string, now time.Time) (string, bool) {
 	if p.cfg.RefreshGracePeriod <= 0 || rt.ConsumedAt.IsZero() {
-		return false
+		return "", false
 	}
 	// Only lateness disqualifies a replay. There is deliberately NO lower bound:
 	// a `now` that precedes the stored stamp is the signature of a genuinely
@@ -852,34 +849,38 @@ func (p *Provider) graceApplies(ctx context.Context, rt RefreshToken, raw, clien
 	// rotation stamped the row — and on a multi-node deployment it is also
 	// ordinary clock skew. Rejecting it revoked the family for the exact case
 	// this window exists to absorb.
+	//
+	// The bound is anchored to the STORED ConsumedAt, which is durable and
+	// stamped exactly once, so the window cannot roll however often the token
+	// is re-presented.
 	if now.After(rt.ConsumedAt.Add(p.cfg.RefreshGracePeriod)) {
-		return false
+		return "", false
 	}
 	if rt.ClientID != clientID {
-		return false
+		return "", false
 	}
-	if len(rt.SuccessorSealed) == 0 {
-		// Mid-rotation: no successor yet, but this is still not reuse.
-		return true
-	}
-	successor, ok := p.openSuccessor(raw, rt.SuccessorSealed)
-	if !ok {
-		return false
+	successor, known := p.recallSuccessor(tokenHash, now)
+	if !known {
+		return "", true
 	}
 	// The family must not have moved on: if the successor was itself already
-	// rotated away, this replay is a token that is two steps stale, which is
-	// reuse however recent it is.
+	// rotated away — or revoked out from under us — this replay is a token that
+	// is two steps stale, which is reuse however recent it is.
 	next, found, err := p.store.GetRefreshToken(ctx, HashSecret(successor))
 	if err != nil || !found {
-		return false
+		return "", false
 	}
-	return next.ConsumedAt.IsZero() && now.Before(next.ExpiresAt)
+	if !next.ConsumedAt.IsZero() || !now.Before(next.ExpiresAt) {
+		return "", false
+	}
+	return successor, true
 }
 
 // issueTokenPair mints a new access/refresh pair, persists the refresh token
-// and, when this is a rotation, seals the new refresh token onto the row of the
-// token it replaces.
-func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, prev rotation, clientID, userID, familyID string, familyCreatedAt time.Time) {
+// and, when this is a rotation, remembers the successor for the length of the
+// grace window. prevHash is the hash of the token being rotated away, or "" for
+// a fresh login.
+func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, prevHash, clientID, userID, familyID string, familyCreatedAt time.Time) {
 	now := p.now()
 
 	refresh, err := randomToken(32)
@@ -894,10 +895,10 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, pr
 		expiresAt = familyExpiresAt
 	}
 
-	// Persist the successor BEFORE linking it onto the predecessor. The reverse
-	// order left a sealed blob pointing at a row that did not exist yet, so a
-	// failed or slow SaveRefreshToken turned the client's next legitimate retry
-	// into a family revocation.
+	// Persist the successor BEFORE it is remembered as one. The reverse order
+	// left a grace answer pointing at a row that did not exist yet, so a failed
+	// or slow SaveRefreshToken turned the client's next legitimate retry into a
+	// family revocation.
 	if err := p.store.SaveRefreshToken(ctx, RefreshToken{
 		TokenHash:       HashSecret(refresh),
 		ClientID:        clientID,
@@ -912,23 +913,14 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, pr
 		return
 	}
 
-	if prev.hash != "" {
-		sealed, err := p.sealSuccessor(prev.raw, refresh)
-		if err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not seal the rotated token")
-			return
-		}
-		if err := p.store.LinkRefreshSuccessor(ctx, prev.hash, familyID, sealed); err != nil {
-			writeOAuthError(w, http.StatusInternalServerError, "server_error", "could not record the token rotation")
-			return
-		}
+	if prevHash != "" {
 		// Re-check the family AFTER the write. A reuse detection that fired
 		// while this rotation was in flight would have deleted the family
 		// between our read and our SaveRefreshToken, and the row we just
 		// inserted would silently resurrect it — the victim stays evicted while
 		// the attacker keeps rotating. The predecessor row disappearing is that
 		// signal: undo our own insert by revoking the family we issued into.
-		_, still, err := p.store.GetRefreshToken(ctx, prev.hash)
+		_, still, err := p.store.GetRefreshToken(ctx, prevHash)
 		if err != nil {
 			// A transient read error is not proof of revocation. The
 			// predecessor is already consumed either way, so nothing usable is
@@ -943,6 +935,9 @@ func (p *Provider) issueTokenPair(ctx context.Context, w http.ResponseWriter, pr
 				"refresh token was already used; the whole token family has been revoked, sign in again")
 			return
 		}
+		// Only now, with the successor persisted and the family confirmed
+		// alive, is the rotation answerable to a duplicate.
+		p.rememberSuccessor(prevHash, refresh, now)
 	}
 
 	p.writeTokenPair(w, userID, refresh, now)

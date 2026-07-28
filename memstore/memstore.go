@@ -120,21 +120,6 @@ func (s *MemoryStore) ConsumeRefreshToken(_ context.Context, tokenHash string, c
 	return before, true, nil
 }
 
-// LinkRefreshSuccessor attaches the sealed successor to a consumed row and
-// re-stamps its family.
-func (s *MemoryStore) LinkRefreshSuccessor(_ context.Context, tokenHash, familyID string, sealed []byte) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rt, ok := s.refresh[tokenHash]
-	if !ok {
-		return nil
-	}
-	rt.FamilyID = familyID
-	rt.SuccessorSealed = sealed
-	s.refresh[tokenHash] = rt
-	return nil
-}
-
 func (s *MemoryStore) RevokeRefreshTokensForUser(_ context.Context, userID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

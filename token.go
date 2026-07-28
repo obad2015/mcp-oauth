@@ -1,8 +1,6 @@
 package mcpoauth
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -31,9 +29,9 @@ const (
 	minJWTSecretDistinct = 8
 )
 
-// refreshSuccessorKeyInfo is the HKDF info prefix for the key that seals a
-// rotation's successor token onto its consumed predecessor row.
-const refreshSuccessorKeyInfo = "mcpoauth/v1/refresh-successor|"
+// legacyFamilyKeyInfo separates the derivation that gives a refresh-token row
+// with no FamilyID a family of its own. See legacyFamilyID.
+const legacyFamilyKeyInfo = "mcpoauth/v1/legacy-family|"
 
 // hkdfExpand is HKDF-Expand (RFC 5869 §2.3) with SHA-256. The input is already
 // a high-entropy secret (New enforces >= 32 bytes), so the extract step is not
@@ -62,56 +60,35 @@ func deriveSigningKey(secret []byte) []byte {
 	return hkdfExpand(secret, []byte(accessTokenKeyInfo), 32)
 }
 
-// successorKey derives the AES key that seals the successor of one specific
-// refresh token. The raw predecessor token is part of the derivation, so the
-// blob can only ever be opened by someone who presents that token — a dump of
-// the refresh-token table (which holds hashes only) is useless.
-func (p *Provider) successorKey(predecessorRaw string) []byte {
-	return hkdfExpand(p.signKey, []byte(refreshSuccessorKeyInfo+predecessorRaw), 32)
+// legacyFamilyID gives a refresh-token row whose FamilyID is empty — one
+// written by older code, or by a Store that drops the column — a family of its
+// own, derived deterministically from the row's token hash.
+//
+// Determinism is the whole point. Rotation has to stamp the successor with SOME
+// family, or the chain opts out of reuse detection and the absolute lifetime cap
+// forever. A random family would be lost the instant the request ended, because
+// nothing writes it back onto the predecessor row: a later replay of that same
+// familyless token would then find nothing to revoke and the chain it spawned
+// would survive. Deriving it means the replay recomputes the same value and
+// kills the chain.
+//
+// The family ID is not a secret and is never accepted from a caller; it is only
+// ever an internal revocation key.
+func legacyFamilyID(tokenHash string) string {
+	return "legacy-" + HashSecret(legacyFamilyKeyInfo + tokenHash)[:32]
 }
 
-// sealSuccessor encrypts successorRaw so it can be handed back to a client that
-// re-presents predecessorRaw inside Config.RefreshGracePeriod.
-func (p *Provider) sealSuccessor(predecessorRaw, successorRaw string) ([]byte, error) {
-	gcm, err := newGCM(p.successorKey(predecessorRaw))
-	if err != nil {
-		return nil, err
+// familyToRevoke returns the family that a reused refresh-token row must take
+// down with it: its own, or — for a row that never had one — the family its
+// rotation would have created.
+func familyToRevoke(rt RefreshToken, tokenHash string) string {
+	if rt.FamilyID != "" {
+		return rt.FamilyID
 	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("generating seal nonce: %w", err)
+	if tokenHash == "" {
+		return ""
 	}
-	return gcm.Seal(nonce, nonce, []byte(successorRaw), []byte(HashSecret(predecessorRaw))), nil
-}
-
-// openSuccessor reverses sealSuccessor. ok=false for anything it cannot
-// authenticate, including a blob written for a different token.
-func (p *Provider) openSuccessor(predecessorRaw string, sealed []byte) (string, bool) {
-	gcm, err := newGCM(p.successorKey(predecessorRaw))
-	if err != nil {
-		return "", false
-	}
-	if len(sealed) < gcm.NonceSize() {
-		return "", false
-	}
-	nonce, ct := sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():]
-	plain, err := gcm.Open(nil, nonce, ct, []byte(HashSecret(predecessorRaw)))
-	if err != nil || len(plain) == 0 {
-		return "", false
-	}
-	return string(plain), true
-}
-
-func newGCM(key []byte) (cipher.AEAD, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("creating cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("creating gcm: %w", err)
-	}
-	return gcm, nil
+	return legacyFamilyID(tokenHash)
 }
 
 // Errors returned by ValidateAccessToken.
