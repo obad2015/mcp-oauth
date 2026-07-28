@@ -65,6 +65,16 @@ const GrantedScope = "openid email profile"
 // WWW-Authenticate challenge.
 const ProtectedResourceMetadataPath = "/.well-known/oauth-protected-resource"
 
+// AuthorizationServerMetadataPath is the well-known path (relative to the
+// issuer host root) where the RFC 8414 authorization-server metadata
+// document is expected to be served.
+const AuthorizationServerMetadataPath = "/.well-known/oauth-authorization-server"
+
+// OpenIDConfigurationPath is an alias some MCP/OAuth clients probe instead
+// of (or in addition to) AuthorizationServerMetadataPath. Both are served by
+// Provider.AuthorizationServerMetadata.
+const OpenIDConfigurationPath = "/.well-known/openid-configuration"
+
 // ConsentNonceField is the form field the interstitial consent page must POST
 // back to the authorization endpoint. It is also carried on ConsentRequest so a
 // custom ConsentHandler never has to hard-code it.
