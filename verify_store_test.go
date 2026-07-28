@@ -51,6 +51,7 @@ type faultStore struct {
 	returnRowAfterStamp         bool
 	overwriteConsumedAt         bool
 	filterExpiredRows           bool
+	getFiltersConsumed          bool
 	nonAtomicConsume            bool
 	linkIsUpsert                bool
 	pendingIsUpsert             bool
@@ -122,6 +123,12 @@ func (f *faultStore) GetRefreshToken(ctx context.Context, hash string) (mcpoauth
 	rt, ok, err := f.Store.GetRefreshToken(ctx, hash)
 	if ok && restamped {
 		rt.ConsumedAt = stamp
+	}
+	if ok && f.getFiltersConsumed && !rt.ConsumedAt.IsZero() {
+		// `AND consumed_at IS NULL` added "by symmetry" with
+		// ConsumeRefreshToken: the row is still there, the Store just refuses
+		// to admit it.
+		return mcpoauth.RefreshToken{}, false, nil
 	}
 	return rt, ok, err
 }
@@ -441,6 +448,15 @@ func TestVerifyStore(t *testing.T) {
 			name:    "filters out expired rows on consume",
 			broken:  func(f *faultStore) { f.filterExpiredRows = true },
 			wantMsg: "Do NOT filter on expires_at",
+		},
+		{
+			// The mirror of the case above, and the one no earlier check could
+			// see: every other Get in the suite reads a row that has not been
+			// consumed yet, so a filtered GetRefreshToken passes them all while
+			// making every rotation revoke its own family.
+			name:    "GetRefreshToken filters out consumed rows",
+			broken:  func(f *faultStore) { f.getFiltersConsumed = true },
+			wantMsg: "GetRefreshToken stopped returning the row",
 		},
 		{
 			name:    "LinkRefreshSuccessor is an upsert",
